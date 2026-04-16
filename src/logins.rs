@@ -54,8 +54,9 @@ impl LoginManager {
     pub async fn start_browser_login(
         &self,
         account: &StoredAccount,
+        data_dir: &std::path::Path,
     ) -> anyhow::Result<LoginStatus> {
-        let mut options = server_options(account.codex_home.clone());
+        let mut options = server_options(account.codex_home(data_dir));
         options.open_browser = false;
         options.port = 0;
         let login_server = run_login_server(options)?;
@@ -85,8 +86,9 @@ impl LoginManager {
     pub async fn start_device_code_login(
         &self,
         account: &StoredAccount,
+        data_dir: &std::path::Path,
     ) -> anyhow::Result<LoginStatus> {
-        let options = server_options(account.codex_home.clone());
+        let options = server_options(account.codex_home(data_dir));
         let device_code = request_device_code(&options).await?;
         let login_id = Uuid::new_v4().to_string();
         let status = LoginStatus {
