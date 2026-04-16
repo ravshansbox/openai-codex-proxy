@@ -17,11 +17,6 @@ impl AppConfig {
             .parse()
             .context("failed to parse OCP_LISTEN_ADDR")?;
 
-        let data_dir = env::var("OCP_DATA_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("data"));
-
         let request_timeout_secs = env::var("OCP_REQUEST_TIMEOUT_SECS")
             .ok()
             .map(|value| value.parse::<u64>())
@@ -31,8 +26,15 @@ impl AppConfig {
 
         Ok(Self {
             listen_addr,
-            data_dir,
+            data_dir: default_data_dir(),
             request_timeout_secs,
         })
     }
+}
+
+fn default_data_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".openai-codex-proxy")
 }
