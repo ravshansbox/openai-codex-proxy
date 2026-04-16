@@ -155,7 +155,7 @@ If the incoming request uses a stale model slug that is not present in the local
 Environment variables:
 
 - `OCP_LISTEN_ADDR` — default `127.0.0.1:8080`
-- `OCP_DATA_DIR` — default `./data`
+- storage path is fixed at `~/.openai-codex-proxy`
 - `OCP_REQUEST_TIMEOUT_SECS` — default `600`
 
 The upstream Responses endpoint is hardcoded to:
@@ -212,6 +212,4 @@ The release workflow will build tarballs for Linux and macOS.
 
 ## Next implementation steps
 
-1. Add downstream authentication and user ownership of accounts.
-2. Add sticky routing/session affinity.
-3. Add account policy controls.
+1. Add sticky routing/session affinity.
