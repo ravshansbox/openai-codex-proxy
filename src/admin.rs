@@ -2,22 +2,34 @@ use crate::accounts::AccountRegistry;
 use crate::accounts::CreateAccountRequest;
 use crate::logins::LoginManager;
 use crate::proxy::AppState;
+use crate::proxy::require_proxy_api_key;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::json;
 use std::sync::Arc;
 
-pub async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "accounts": state.accounts.list_summaries().await }))
+pub async fn list_accounts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
+    Json(json!({ "accounts": state.accounts.list_summaries().await })).into_response()
 }
 
 pub async fn create_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     maybe_request: Option<Json<CreateAccountRequest>>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     let request = maybe_request
         .map(|Json(request)| request)
         .unwrap_or_default();
@@ -33,8 +45,12 @@ pub async fn create_account(
 
 pub async fn get_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     match state.accounts.get_summary(&account_id).await {
         Some(account) => (StatusCode::OK, Json(json!({ "account": account }))).into_response(),
         None => (
@@ -47,8 +63,12 @@ pub async fn get_account(
 
 pub async fn delete_account(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     match state.accounts.delete_account(&account_id).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "deleted": true }))).into_response(),
         Ok(false) => (
@@ -66,8 +86,12 @@ pub async fn delete_account(
 
 pub async fn start_browser_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     start_login(
         &state.accounts,
         &state.logins,
@@ -79,8 +103,12 @@ pub async fn start_browser_login(
 
 pub async fn create_and_start_browser_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     maybe_request: Option<Json<CreateAccountRequest>>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     let request = maybe_request
         .map(|Json(request)| request)
         .unwrap_or_default();
@@ -89,8 +117,12 @@ pub async fn create_and_start_browser_login(
 
 pub async fn start_device_code_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     start_login(
         &state.accounts,
         &state.logins,
@@ -102,8 +134,12 @@ pub async fn start_device_code_login(
 
 pub async fn create_and_start_device_code_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     maybe_request: Option<Json<CreateAccountRequest>>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     let request = maybe_request
         .map(|Json(request)| request)
         .unwrap_or_default();
@@ -118,8 +154,12 @@ pub async fn create_and_start_device_code_login(
 
 pub async fn get_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(login_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     match state.logins.get(&login_id).await {
         Some(login) => (StatusCode::OK, Json(json!({ "login": login }))).into_response(),
         None => (
@@ -132,8 +172,12 @@ pub async fn get_login(
 
 pub async fn cancel_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(login_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return err.into_response();
+    }
     match state.logins.cancel(&login_id).await {
         Some(login) => (StatusCode::OK, Json(json!({ "login": login }))).into_response(),
         None => (

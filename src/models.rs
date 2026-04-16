@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::proxy::AppState;
+use crate::proxy::require_proxy_api_key;
 
 #[derive(Clone, Debug)]
 pub struct ModelsCache {
@@ -87,7 +88,13 @@ impl ModelsCache {
     }
 }
 
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Response<axum::body::Body> {
+pub async fn list_models(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response<axum::body::Body> {
+    if let Err(err) = require_proxy_api_key(&state, &headers) {
+        return axum::response::IntoResponse::into_response(err);
+    }
     let json = state.models_cache.models_response_json();
     let mut response = (StatusCode::OK, Json(json)).into_response();
     if let Some(etag) = state.models_cache.etag()

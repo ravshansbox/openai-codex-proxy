@@ -3,6 +3,7 @@ use crate::accounts::ResolvedUpstreamAuth;
 use crate::accounts::RouteError;
 use crate::logins::LoginManager;
 use crate::models::ModelsCache;
+use crate::proxy_auth::ProxyAuth;
 use axum::Json;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -12,6 +13,7 @@ use axum::http::HeaderName;
 use axum::http::HeaderValue;
 use axum::http::Response;
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::http::header::ACCEPT;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONNECTION;
@@ -46,6 +48,7 @@ pub struct AppState {
     pub logins: LoginManager,
     pub models_cache: ModelsCache,
     pub installation_id: String,
+    pub proxy_auth: ProxyAuth,
 }
 
 #[derive(serde::Serialize)]
@@ -66,6 +69,7 @@ pub async fn proxy_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    require_proxy_api_key(&state, &headers)?;
     let requested_account_id = header_value(&headers, ACCOUNT_ID_HEADER)?;
     let session_id = headers
         .get(SESSION_ID_HEADER)
@@ -81,7 +85,6 @@ pub async fn proxy_responses(
         body,
         content_encoding,
     );
-    let body_preview = String::from_utf8_lossy(&body).to_string();
     let mut excluded_account_ids = Vec::new();
 
     loop {
@@ -98,7 +101,6 @@ pub async fn proxy_responses(
             account_id = account_id,
             score = selected.lease.score(),
             rewritten_model = rewritten_model.as_deref(),
-            request_body = %body_preview,
             excluded_accounts = ?excluded_account_ids,
             "proxying responses request"
         );
@@ -142,7 +144,7 @@ pub async fn proxy_responses(
         let status = upstream_response.status();
         let response_headers = upstream_response.headers().clone();
         let body_bytes = upstream_response.bytes().await.unwrap_or_default();
-        let response_body = String::from_utf8_lossy(&body_bytes).to_string();
+        let _response_body = String::from_utf8_lossy(&body_bytes).to_string();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             let resets_at = parse_i64_header(&response_headers, "x-codex-primary-reset-at");
@@ -156,7 +158,6 @@ pub async fn proxy_responses(
                 account_id = account_id,
                 resets_at = resets_at,
                 used_percent = used_percent,
-                response_body = %response_body,
                 "account hit usage limit, trying next account"
             );
             continue;
@@ -166,10 +167,27 @@ pub async fn proxy_responses(
         tracing::error!(
             status = %status,
             response_headers = ?response_headers,
-            response_body = %response_body,
             "upstream returned non-success status"
         );
         return Err(ApiError::Internal(format!("upstream returned {status}")));
+    }
+}
+
+pub(crate) fn require_proxy_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if !state.proxy_auth.is_configured() {
+        return Err(ApiError::ProxyAuthNotConfigured);
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::ProxyAuthMissing)?;
+    if state.proxy_auth.verify_bearer_token(bearer) {
+        Ok(())
+    } else {
+        Err(ApiError::ProxyAuthInvalid)
     }
 }
 
@@ -403,6 +421,12 @@ fn should_skip_request_header(header_name: &HeaderName) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("proxy API key is not configured")]
+    ProxyAuthNotConfigured,
+    #[error("missing proxy API key")]
+    ProxyAuthMissing,
+    #[error("invalid proxy API key")]
+    ProxyAuthInvalid,
     #[error("invalid value for {header_name}: {message}")]
     InvalidHeaderValue {
         header_name: String,
@@ -419,6 +443,8 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match &self {
+            Self::ProxyAuthNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ProxyAuthMissing | Self::ProxyAuthInvalid => StatusCode::UNAUTHORIZED,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::Route(RouteError::NoAccountsConfigured) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Route(RouteError::AccountAuthFailed { .. }) => StatusCode::BAD_GATEWAY,

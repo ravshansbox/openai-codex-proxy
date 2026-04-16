@@ -24,12 +24,12 @@ This scaffold now includes:
 - `GET /v1/models` from the local Codex model cache
 - `POST /v1/responses` proxying using stored OAuth state
 - automatic routing across all authenticated accounts
+- single proxy API key protection for `/v1/*`
 - request-time rewrite for stale unsupported model slugs using the local model cache
-- a direct CLI helper for login and account listing
+- a direct CLI helper for login, account listing, and proxy API key setup
 
 It still does **not** yet include:
 
-- live usage polling from Codex backend
 - per-user account ownership and downstream authn/authz
 - sticky routing/session affinity
 
@@ -58,6 +58,25 @@ Verbose output:
 cargo run -- list-accounts --verbose
 ```
 
+### Set the proxy API key
+```bash
+cargo run -- set-api-key
+```
+
+Or provide an explicit key:
+
+```bash
+cargo run -- set-api-key sk-local
+```
+
+Check whether one is configured:
+
+```bash
+cargo run -- api-key-status
+```
+
+If you change the key while the proxy is already running, restart the proxy so the new key is picked up.
+
 ### Start the proxy
 ```bash
 cargo run
@@ -69,6 +88,12 @@ or
 cargo run -- serve
 ```
 
+All management and API endpoints except `/health` require:
+
+```text
+Authorization: Bearer <proxy-api-key>
+```
+
 ## HTTP API
 
 ### Health
@@ -76,6 +101,8 @@ cargo run -- serve
 - `GET /health`
 
 ### Accounts
+
+These endpoints require the proxy API key.
 
 - `GET /accounts`
 - `POST /accounts`
@@ -91,6 +118,8 @@ Create account body:
 ```
 
 ### Login flows
+
+These endpoints also require the proxy API key.
 
 Recommended one-step endpoints:
 
@@ -139,6 +168,7 @@ https://chatgpt.com/backend-api/codex/responses
 
 ```bash
 cd ~/Projects/openai-codex-proxy
+cargo run -- set-api-key sk-local
 cargo run -- login --browser
 cargo run -- login --device-auth
 cargo run -- list-accounts
@@ -163,9 +193,25 @@ codex exec \
   'Hello through the proxy'
 ```
 
+## Install and release
+
+Local install from git:
+
+```bash
+cargo install --git https://github.com/ravshansbox/openai-codex-proxy.git openai-codex-proxy
+```
+
+GitHub Releases are built from tags that start with `v`, for example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow will build tarballs for Linux and macOS.
+
 ## Next implementation steps
 
-1. Poll Codex usage/rate limits and update account routing scores live.
-2. Add downstream authentication and user ownership of accounts.
-3. Add sticky routing/session affinity.
-4. Add account policy controls.
+1. Add downstream authentication and user ownership of accounts.
+2. Add sticky routing/session affinity.
+3. Add account policy controls.
