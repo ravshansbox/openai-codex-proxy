@@ -1,0 +1,137 @@
+mod accounts;
+mod admin;
+mod cli;
+mod config;
+mod installation;
+mod logins;
+mod models;
+mod proxy;
+
+use crate::accounts::AccountRegistry;
+use crate::cli::Cli;
+use crate::cli::Command;
+use crate::config::AppConfig;
+use crate::installation::load_or_create_installation_id;
+use crate::logins::LoginManager;
+use crate::models::ModelsCache;
+use crate::proxy::AppState;
+use anyhow::Context;
+use axum::Router;
+use axum::routing::get;
+use axum::routing::post;
+use clap::Parser;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let config = AppConfig::from_env()?;
+
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => {
+            init_tracing();
+            run_server(config).await
+        }
+        Command::Login(args) => cli::handle_login_command(&config, args).await,
+        Command::ListAccounts(args) => cli::handle_list_accounts_command(&config, args).await,
+    }
+}
+
+async fn run_server(config: AppConfig) -> anyhow::Result<()> {
+    let accounts = AccountRegistry::load_or_create(config.data_dir.clone()).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let installation_id = load_or_create_installation_id(&config.data_dir)
+        .context("failed to load or create installation id")?;
+    let state = Arc::new(AppState {
+        client,
+        accounts,
+        logins: LoginManager::default(),
+        models_cache: ModelsCache::default(),
+        installation_id,
+    });
+
+    let app = Router::new()
+        .route("/health", get(proxy::health))
+        .route(
+            "/accounts",
+            get(admin::list_accounts).post(admin::create_account),
+        )
+        .route(
+            "/accounts/{account_id}",
+            get(admin::get_account).delete(admin::delete_account),
+        )
+        .route(
+            "/accounts/login/browser/start",
+            post(admin::create_and_start_browser_login),
+        )
+        .route(
+            "/accounts/login/device-code/start",
+            post(admin::create_and_start_device_code_login),
+        )
+        .route(
+            "/accounts/{account_id}/login/browser/start",
+            post(admin::start_browser_login),
+        )
+        .route(
+            "/accounts/{account_id}/login/device-code/start",
+            post(admin::start_device_code_login),
+        )
+        .route("/logins/{login_id}", get(admin::get_login))
+        .route("/logins/{login_id}/cancel", post(admin::cancel_login))
+        .route("/v1/models", get(models::list_models))
+        .route("/v1/responses", post(proxy::proxy_responses))
+        .with_state(state);
+
+    let listener = TcpListener::bind(config.listen_addr)
+        .await
+        .with_context(|| format!("failed to bind {}", config.listen_addr))?;
+
+    tracing::info!(listen_addr = %config.listen_addr, "openai-codex-proxy listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+    Ok(())
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received");
+}
