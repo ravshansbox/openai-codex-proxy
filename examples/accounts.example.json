@@ -1,0 +1,32 @@
+[
+  {
+    "id": "personal-main",
+    "label": "Personal Main",
+    "tags": ["personal", "default", "interactive"],
+    "state": "healthy",
+    "used_percent": 12,
+    "preference": 5,
+    "bearer_token_env_var": "PERSONAL_MAIN_CODEX_BEARER_TOKEN",
+    "chatgpt_account_id_env_var": "PERSONAL_MAIN_CHATGPT_ACCOUNT_ID"
+  },
+  {
+    "id": "company-primary",
+    "label": "Company Primary",
+    "tags": ["company", "default", "high-priority"],
+    "state": "healthy",
+    "used_percent": 34,
+    "preference": 10,
+    "bearer_token_env_var": "COMPANY_PRIMARY_CODEX_BEARER_TOKEN",
+    "chatgpt_account_id_env_var": "COMPANY_PRIMARY_CHATGPT_ACCOUNT_ID"
+  },
+  {
+    "id": "company-backup",
+    "label": "Company Backup",
+    "tags": ["company", "batch", "overflow"],
+    "state": "healthy",
+    "used_percent": 21,
+    "preference": 3,
+    "bearer_token_env_var": "COMPANY_BACKUP_CODEX_BEARER_TOKEN",
+    "chatgpt_account_id_env_var": "COMPANY_BACKUP_CHATGPT_ACCOUNT_ID"
+  }
+]
