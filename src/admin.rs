@@ -207,9 +207,11 @@ async fn start_login(
             .into_response();
     };
 
+    let data_dir = accounts.data_dir();
+
     let result = match mode {
-        LoginMode::Browser => logins.start_browser_login(&account).await,
-        LoginMode::DeviceCode => logins.start_device_code_login(&account).await,
+        LoginMode::Browser => logins.start_browser_login(&account, data_dir).await,
+        LoginMode::DeviceCode => logins.start_device_code_login(&account, data_dir).await,
     };
 
     match result {
@@ -239,9 +241,10 @@ async fn create_and_start_login(
         }
     };
 
+    let data_dir = accounts.data_dir();
     let result = match mode {
-        LoginMode::Browser => logins.start_browser_login(&account).await,
-        LoginMode::DeviceCode => logins.start_device_code_login(&account).await,
+        LoginMode::Browser => logins.start_browser_login(&account, data_dir).await,
+        LoginMode::DeviceCode => logins.start_device_code_login(&account, data_dir).await,
     };
 
     match result {

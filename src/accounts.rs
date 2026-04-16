@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -51,7 +52,12 @@ pub struct StoredAccount {
     pub resets_at: Option<i64>,
     #[serde(default)]
     pub preference: i32,
-    pub codex_home: PathBuf,
+}
+
+impl StoredAccount {
+    pub fn codex_home(&self, data_dir: &Path) -> PathBuf {
+        data_dir.join("accounts").join(&self.id)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -100,19 +106,30 @@ pub struct AccountSummary {
 #[derive(Debug)]
 pub struct AccountHandle {
     record: RwLock<StoredAccount>,
+    data_dir: PathBuf,
     inflight: AtomicUsize,
     recent_failures: AtomicU32,
     cooldown_until: AtomicI64,
 }
 
 impl AccountHandle {
-    fn new(record: StoredAccount) -> Self {
+    fn new(record: StoredAccount, data_dir: PathBuf) -> Self {
         Self {
             record: RwLock::new(record),
+            data_dir,
             inflight: AtomicUsize::new(0),
             recent_failures: AtomicU32::new(0),
             cooldown_until: AtomicI64::new(0),
         }
+    }
+
+    fn codex_home(&self) -> PathBuf {
+        let id = self
+            .record
+            .read()
+            .map(|guard| guard.id.clone())
+            .unwrap_or_default();
+        self.data_dir.join("accounts").join(id)
     }
 
     pub fn id(&self) -> String {
@@ -132,7 +149,6 @@ impl AccountHandle {
                 used_percent: None,
                 resets_at: None,
                 preference: 0,
-                codex_home: PathBuf::new(),
             })
     }
 
@@ -223,9 +239,8 @@ impl AccountHandle {
     }
 
     fn auth_manager(&self) -> AuthManager {
-        let record = self.record();
         AuthManager::new(
-            record.codex_home,
+            self.codex_home(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
         )
@@ -338,7 +353,7 @@ impl AccountHandle {
             cooldown_until: (cooldown_until > current_unix_seconds()).then_some(cooldown_until),
             inflight: self.inflight.load(Ordering::Relaxed),
             recent_failures: self.recent_failures.load(Ordering::Relaxed),
-            codex_home: record.codex_home.display().to_string(),
+            codex_home: self.codex_home().display().to_string(),
             auth: self.auth_snapshot().await,
             usage: self.usage_snapshot().await,
         }
@@ -375,8 +390,7 @@ impl AccountRegistry {
                 .with_context(|| format!("failed to parse {}", accounts_path.display()))?;
             stored
                 .into_iter()
-                .map(AccountHandle::new)
-                .map(Arc::new)
+                .map(|account| Arc::new(AccountHandle::new(account, data_dir.clone())))
                 .collect()
         } else {
             Vec::new()
@@ -388,6 +402,10 @@ impl AccountRegistry {
             accounts: Arc::new(AsyncRwLock::new(accounts)),
             session_affinity: Arc::new(AsyncRwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub async fn list_summaries(&self) -> Vec<AccountSummary> {
@@ -420,10 +438,9 @@ impl AccountRegistry {
             used_percent: None,
             resets_at: None,
             preference: request.preference,
-            codex_home,
         };
 
-        let handle = Arc::new(AccountHandle::new(account.clone()));
+        let handle = Arc::new(AccountHandle::new(account.clone(), self.data_dir.clone()));
         self.accounts.write().await.push(handle);
         self.persist().await?;
         Ok(account)
@@ -432,11 +449,11 @@ impl AccountRegistry {
     pub async fn delete_account(&self, account_id: &str) -> anyhow::Result<bool> {
         let mut accounts = self.accounts.write().await;
         let before = accounts.len();
-        let removed_paths = accounts
+        let removed_paths: Vec<PathBuf> = accounts
             .iter()
             .filter(|account| account.id() == account_id)
-            .map(|account| account.record().codex_home)
-            .collect::<Vec<_>>();
+            .map(|account| account.codex_home())
+            .collect();
         accounts.retain(|account| account.id() != account_id);
         let removed = accounts.len() != before;
         drop(accounts);
@@ -469,7 +486,7 @@ impl AccountRegistry {
 
         let bound_account_id = if requested_account_id.is_none() {
             match session_id {
-                Some(session_id) => self.session_affinity.read().await.get(session_id).cloned(),
+                Some(sid) => self.session_affinity.read().await.get(sid).cloned(),
                 None => None,
             }
         } else {
@@ -497,8 +514,8 @@ impl AccountRegistry {
                     });
                 }
                 Err(ResolveAuthError::NotAuthenticated) | Err(ResolveAuthError::Token(_)) => {
-                    if let Some(session_id) = session_id {
-                        self.clear_session_affinity(session_id).await;
+                    if let Some(sid) = session_id {
+                        self.clear_session_affinity(sid).await;
                     }
                 }
             }
@@ -551,8 +568,8 @@ impl AccountRegistry {
             match account.resolve_upstream_auth().await {
                 Ok(auth) => {
                     account.inflight.fetch_add(1, Ordering::Relaxed);
-                    if let Some(session_id) = session_id {
-                        self.bind_session_affinity(session_id, &account.id()).await;
+                    if let Some(sid) = session_id {
+                        self.bind_session_affinity(sid, &account.id()).await;
                     }
                     return Ok(SelectedAccount {
                         lease: AccountLease { account, score },
@@ -560,8 +577,8 @@ impl AccountRegistry {
                     });
                 }
                 Err(ResolveAuthError::NotAuthenticated) => {
-                    if let Some(session_id) = session_id {
-                        self.clear_session_affinity(session_id).await;
+                    if let Some(sid) = session_id {
+                        self.clear_session_affinity(sid).await;
                     }
                     continue;
                 }
@@ -588,8 +605,8 @@ impl AccountRegistry {
         if let Some(account) = self.find_handle(account_id).await {
             account.note_rate_limited(resets_at, used_percent);
         }
-        if let Some(session_id) = session_id {
-            self.clear_session_affinity(session_id).await;
+        if let Some(sid) = session_id {
+            self.clear_session_affinity(sid).await;
         }
     }
 

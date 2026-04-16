@@ -61,9 +61,9 @@ pub async fn handle_login_command(config: &AppConfig, args: LoginArgs) -> anyhow
         .await?;
 
     let login_result = if args.device_auth {
-        login_with_device_code(&account).await
+        login_with_device_code(&account, &config.data_dir).await
     } else {
-        login_with_browser(&account).await
+        login_with_browser(&account, &config.data_dir).await
     };
 
     match login_result {
@@ -233,9 +233,12 @@ fn format_used_percent(used_percent: f64) -> String {
     format!("{:.0}%", used_percent)
 }
 
-async fn login_with_browser(account: &StoredAccount) -> anyhow::Result<()> {
+async fn login_with_browser(
+    account: &StoredAccount,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     let opts = ServerOptions::new(
-        account.codex_home.clone(),
+        account.codex_home(data_dir),
         CLIENT_ID.to_string(),
         /*forced_chatgpt_workspace_id*/ None,
         AuthCredentialsStoreMode::File,
@@ -252,9 +255,12 @@ async fn login_with_browser(account: &StoredAccount) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn login_with_device_code(account: &StoredAccount) -> anyhow::Result<()> {
+async fn login_with_device_code(
+    account: &StoredAccount,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     let opts = ServerOptions::new(
-        account.codex_home.clone(),
+        account.codex_home(data_dir),
         CLIENT_ID.to_string(),
         /*forced_chatgpt_workspace_id*/ None,
         AuthCredentialsStoreMode::File,

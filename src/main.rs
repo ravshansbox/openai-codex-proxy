@@ -114,7 +114,7 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
 }
 
 async fn usage_refresh_loop(state: Arc<AppState>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(Duration::from_secs(600));
     loop {
         interval.tick().await;
         if let Err(err) = state.accounts.refresh_usage_state().await {
@@ -125,7 +125,7 @@ async fn usage_refresh_loop(state: Arc<AppState>) {
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,codex_client=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
