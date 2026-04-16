@@ -2,6 +2,52 @@
 
 A standalone proxy that makes **Codex CLI** see a local service as an OpenAI-compatible Responses backend while the proxy routes requests across one or more **Codex subscription / ChatGPT-authenticated accounts**.
 
+## Installation
+
+### Prerequisites
+
+- Rust toolchain with `cargo`
+- a local Codex CLI installation, because this proxy reads Codex auth and model cache data
+
+### Install from git
+
+```bash
+cargo install --git https://github.com/ravshansbox/openai-codex-proxy.git openai-codex-proxy
+```
+
+This installs the `openai-codex-proxy` binary into Cargo's bin directory, typically `~/.cargo/bin`.
+
+### Run from source instead
+
+```bash
+git clone https://github.com/ravshansbox/openai-codex-proxy.git
+cd openai-codex-proxy
+cargo run -- --help
+```
+
+If you installed the binary with `cargo install`, use `openai-codex-proxy ...`.
+If you are running from a checkout, use `cargo run -- ...`.
+
+## Quick start
+
+Installed binary:
+
+```bash
+openai-codex-proxy set-api-key sk-local
+openai-codex-proxy login --browser
+openai-codex-proxy list-accounts
+openai-codex-proxy serve
+```
+
+Run from source:
+
+```bash
+cargo run -- set-api-key sk-local
+cargo run -- login --browser
+cargo run -- list-accounts
+cargo run -- serve
+```
+
 ## What this project is for
 
 Downstream, Codex CLI talks to this proxy like a normal OpenAI-style provider:
@@ -34,6 +80,8 @@ It still does **not** yet include:
 - sticky routing/session affinity
 
 ## Main way to use it
+
+The examples below use `cargo run -- ...`. If you installed the binary, replace that prefix with `openai-codex-proxy`.
 
 ### Log in an account in browser
 ```bash
@@ -164,17 +212,6 @@ The upstream Responses endpoint is hardcoded to:
 https://chatgpt.com/backend-api/codex/responses
 ```
 
-## Quick start
-
-```bash
-cd ~/Projects/openai-codex-proxy
-cargo run -- set-api-key sk-local
-cargo run -- login --browser
-cargo run -- login --device-auth
-cargo run -- list-accounts
-cargo run
-```
-
 ## Codex CLI configuration example
 
 Point Codex CLI at the proxy as a custom model provider:
@@ -193,13 +230,7 @@ codex exec \
   'Hello through the proxy'
 ```
 
-## Install and release
-
-Local install from git:
-
-```bash
-cargo install --git https://github.com/ravshansbox/openai-codex-proxy.git openai-codex-proxy
-```
+## Release
 
 GitHub Releases are built from tags that start with `v`, for example:
 
@@ -209,4 +240,3 @@ git push origin v0.1.0
 ```
 
 The release workflow will build tarballs for Linux and macOS.
-
