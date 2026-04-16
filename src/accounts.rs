@@ -5,6 +5,7 @@ use codex_login::AuthManager;
 use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -357,6 +358,7 @@ pub struct AccountRegistry {
     data_dir: PathBuf,
     accounts_path: PathBuf,
     accounts: Arc<AsyncRwLock<Vec<Arc<AccountHandle>>>>,
+    session_affinity: Arc<AsyncRwLock<HashMap<String, String>>>,
 }
 
 impl AccountRegistry {
@@ -384,6 +386,7 @@ impl AccountRegistry {
             data_dir,
             accounts_path,
             accounts: Arc::new(AsyncRwLock::new(accounts)),
+            session_affinity: Arc::new(AsyncRwLock::new(HashMap::new())),
         })
     }
 
@@ -456,11 +459,49 @@ impl AccountRegistry {
     pub async fn select_account(
         &self,
         requested_account_id: Option<&str>,
+        session_id: Option<&str>,
         excluded_account_ids: &[String],
     ) -> Result<SelectedAccount, RouteError> {
         let accounts = self.accounts.read().await.clone();
         if accounts.is_empty() {
             return Err(RouteError::NoAccountsConfigured);
+        }
+
+        let bound_account_id = if requested_account_id.is_none() {
+            match session_id {
+                Some(session_id) => self.session_affinity.read().await.get(session_id).cloned(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(bound_account_id) = bound_account_id
+            && !excluded_account_ids
+                .iter()
+                .any(|id| id == &bound_account_id)
+            && let Some(account) = accounts
+                .iter()
+                .find(|account| account.id() == bound_account_id)
+            && let Some(score) = account.score()
+        {
+            match account.resolve_upstream_auth().await {
+                Ok(auth) => {
+                    account.inflight.fetch_add(1, Ordering::Relaxed);
+                    return Ok(SelectedAccount {
+                        lease: AccountLease {
+                            account: Arc::clone(account),
+                            score,
+                        },
+                        auth,
+                    });
+                }
+                Err(ResolveAuthError::NotAuthenticated) | Err(ResolveAuthError::Token(_)) => {
+                    if let Some(session_id) = session_id {
+                        self.clear_session_affinity(session_id).await;
+                    }
+                }
+            }
         }
 
         let candidate_accounts = accounts
@@ -510,12 +551,20 @@ impl AccountRegistry {
             match account.resolve_upstream_auth().await {
                 Ok(auth) => {
                     account.inflight.fetch_add(1, Ordering::Relaxed);
+                    if let Some(session_id) = session_id {
+                        self.bind_session_affinity(session_id, &account.id()).await;
+                    }
                     return Ok(SelectedAccount {
                         lease: AccountLease { account, score },
                         auth,
                     });
                 }
-                Err(ResolveAuthError::NotAuthenticated) => continue,
+                Err(ResolveAuthError::NotAuthenticated) => {
+                    if let Some(session_id) = session_id {
+                        self.clear_session_affinity(session_id).await;
+                    }
+                    continue;
+                }
                 Err(ResolveAuthError::Token(_)) => {
                     return Err(RouteError::AccountAuthFailed {
                         account_id: account.id(),
@@ -532,11 +581,15 @@ impl AccountRegistry {
     pub async fn mark_rate_limited(
         &self,
         account_id: &str,
+        session_id: Option<&str>,
         resets_at: Option<i64>,
         used_percent: Option<u8>,
     ) {
         if let Some(account) = self.find_handle(account_id).await {
             account.note_rate_limited(resets_at, used_percent);
+        }
+        if let Some(session_id) = session_id {
+            self.clear_session_affinity(session_id).await;
         }
     }
 
@@ -547,6 +600,17 @@ impl AccountRegistry {
             .iter()
             .find(|account| account.id() == account_id)
             .cloned()
+    }
+
+    async fn bind_session_affinity(&self, session_id: &str, account_id: &str) {
+        self.session_affinity
+            .write()
+            .await
+            .insert(session_id.to_string(), account_id.to_string());
+    }
+
+    async fn clear_session_affinity(&self, session_id: &str) {
+        self.session_affinity.write().await.remove(session_id);
     }
 
     pub async fn refresh_usage_state(&self) -> anyhow::Result<()> {

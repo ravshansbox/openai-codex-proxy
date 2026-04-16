@@ -90,7 +90,11 @@ pub async fn proxy_responses(
     loop {
         let selected = state
             .accounts
-            .select_account(requested_account_id.as_deref(), &excluded_account_ids)
+            .select_account(
+                requested_account_id.as_deref(),
+                Some(session_id.as_str()),
+                &excluded_account_ids,
+            )
             .await?;
         let account_id = selected.lease.account_id();
         let account_score = selected.lease.score().to_string();
@@ -151,7 +155,12 @@ pub async fn proxy_responses(
             let used_percent = parse_u8_header(&response_headers, "x-codex-primary-used-percent");
             state
                 .accounts
-                .mark_rate_limited(&account_id, resets_at, used_percent)
+                .mark_rate_limited(
+                    &account_id,
+                    Some(session_id.as_str()),
+                    resets_at,
+                    used_percent,
+                )
                 .await;
             excluded_account_ids.push(account_id.clone());
             tracing::warn!(
