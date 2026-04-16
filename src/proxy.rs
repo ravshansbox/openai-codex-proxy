@@ -2,7 +2,6 @@ use crate::accounts::AccountRegistry;
 use crate::accounts::ResolvedUpstreamAuth;
 use crate::accounts::RouteError;
 use crate::logins::LoginManager;
-use crate::models::ModelsCache;
 use crate::proxy_auth::ProxyAuth;
 use axum::Json;
 use axum::body::Body;
@@ -46,7 +45,6 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub accounts: AccountRegistry,
     pub logins: LoginManager,
-    pub models_cache: ModelsCache,
     pub installation_id: String,
     pub proxy_auth: ProxyAuth,
 }
@@ -79,12 +77,8 @@ pub async fn proxy_responses(
     let content_encoding = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok());
-    let (body, rewritten_model) = rewrite_body_for_upstream(
-        &state.models_cache,
-        &state.installation_id,
-        body,
-        content_encoding,
-    );
+    let (body, rewritten_model) =
+        rewrite_body_for_upstream(&state.installation_id, body, content_encoding);
     let mut excluded_account_ids = Vec::new();
 
     loop {
@@ -98,8 +92,7 @@ pub async fn proxy_responses(
             .await?;
         let account_id = selected.lease.account_id();
         let account_score = selected.lease.score().to_string();
-        let upstream_headers =
-            build_upstream_headers(&headers, &selected.auth, &state.models_cache, &session_id)?;
+        let upstream_headers = build_upstream_headers(&headers, &selected.auth, &session_id)?;
 
         tracing::info!(
             account_id = account_id,
@@ -233,7 +226,6 @@ fn parse_u8_header(headers: &HeaderMap, header_name: &str) -> Option<u8> {
 fn build_upstream_headers(
     incoming_headers: &HeaderMap,
     auth: &ResolvedUpstreamAuth,
-    models_cache: &ModelsCache,
     session_id: &str,
 ) -> Result<HeaderMap, ApiError> {
     let mut upstream_headers = HeaderMap::new();
@@ -261,10 +253,8 @@ fn build_upstream_headers(
         })?;
         upstream_headers.insert(HeaderName::from_static(SESSION_ID_HEADER), value);
     }
-    if !upstream_headers.contains_key(VERSION_HEADER)
-        && let Some(version) = models_cache.client_version()
-    {
-        let value = HeaderValue::from_str(&version)
+    if !upstream_headers.contains_key(VERSION_HEADER) {
+        let value = HeaderValue::from_str(env!("CARGO_PKG_VERSION"))
             .map_err(|err| ApiError::Internal(format!("failed to build version header: {err}")))?;
         upstream_headers.insert(HeaderName::from_static(VERSION_HEADER), value);
     }
@@ -293,7 +283,6 @@ fn build_upstream_headers(
 }
 
 fn rewrite_body_for_upstream(
-    models_cache: &ModelsCache,
     installation_id: &str,
     body: Bytes,
     content_encoding: Option<&str>,
@@ -302,8 +291,7 @@ fn rewrite_body_for_upstream(
         let Ok(decoded) = zstd::stream::decode_all(std::io::Cursor::new(&body)) else {
             return (body, None);
         };
-        let (rewritten, model) =
-            rewrite_json_body(models_cache, installation_id, Bytes::from(decoded));
+        let (rewritten, model) = rewrite_json_body(installation_id, Bytes::from(decoded));
         if model.is_none() {
             return (body, None);
         }
@@ -312,26 +300,16 @@ fn rewrite_body_for_upstream(
             Err(_) => (body, None),
         }
     } else {
-        rewrite_json_body(models_cache, installation_id, body)
+        rewrite_json_body(installation_id, body)
     }
 }
 
-fn rewrite_json_body(
-    models_cache: &ModelsCache,
-    installation_id: &str,
-    body: Bytes,
-) -> (Bytes, Option<String>) {
+fn rewrite_json_body(installation_id: &str, body: Bytes) -> (Bytes, Option<String>) {
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (body, None);
     };
-    let rewritten_model = json
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .filter(|model| !models_cache.contains_model_slug(model))
-        .and_then(|_| models_cache.best_supported_model_slug());
-    if let Some(replacement) = rewritten_model.as_ref() {
-        json["model"] = serde_json::Value::String(replacement.clone());
-    }
+    // No local model cache; pass through the model as-is.
+    let rewritten_model = None;
     lift_input_instructions(&mut json);
     if let Some(root) = json.as_object_mut() {
         root.remove("max_output_tokens");
