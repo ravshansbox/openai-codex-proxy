@@ -99,13 +99,18 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
         .route("/logins/{login_id}/cancel", post(admin::cancel_login))
         .route("/v1/models", get(models::list_models))
         .route("/v1/responses", post(proxy::proxy_responses))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;
 
-    tracing::info!(listen_addr = %config.listen_addr, "openai-codex-proxy listening");
+    tracing::info!("listen_addr={}", config.listen_addr);
+    if let Some(api_key) = state.proxy_auth.api_key() {
+        tracing::info!("api_key={api_key}");
+    } else {
+        tracing::warn!("api key: not configured — run `openai-codex-proxy set-api-key`");
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -126,7 +131,10 @@ async fn usage_refresh_loop(state: Arc<AppState>) {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,codex_client=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 }
 
 async fn shutdown_signal() {
