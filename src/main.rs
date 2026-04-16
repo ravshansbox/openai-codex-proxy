@@ -14,7 +14,6 @@ use crate::cli::Command;
 use crate::config::AppConfig;
 use crate::installation::load_or_create_installation_id;
 use crate::logins::LoginManager;
-use crate::models::ModelsCache;
 use crate::proxy::AppState;
 use crate::proxy_auth::ProxyAuth;
 use anyhow::Context;
@@ -63,7 +62,6 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
         client,
         accounts,
         logins: LoginManager::default(),
-        models_cache: ModelsCache::default(),
         installation_id,
         proxy_auth,
     });

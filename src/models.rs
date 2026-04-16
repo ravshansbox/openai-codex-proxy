@@ -1,108 +1,146 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderValue;
-use axum::http::Response;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::Value;
-use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::proxy::AppState;
 use crate::proxy::require_proxy_api_key;
 
-#[derive(Clone, Debug)]
-pub struct ModelsCache {
-    path: PathBuf,
-}
+/// Pretend to be the latest Codex CLI so the upstream returns the full model catalog.
+const CODEX_CLIENT_VERSION: &str = "0.121.0";
+const UPSTREAM_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 
-impl Default for ModelsCache {
-    fn default() -> Self {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Self {
-            path: PathBuf::from(home).join(".codex/models_cache.json"),
-        }
-    }
-}
-
-impl ModelsCache {
-    pub fn load_json(&self) -> Value {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| serde_json::json!({ "models": [] }))
-    }
-
-    pub fn models_response_json(&self) -> Value {
-        let json = self.load_json();
-        let models = json
-            .get("models")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        serde_json::json!({ "models": models })
-    }
-
-    pub fn best_supported_model_slug(&self) -> Option<String> {
-        let json = self.load_json();
-        let models = json.get("models")?.as_array()?;
-        models
-            .iter()
-            .filter(|model| model.get("supported_in_api").and_then(Value::as_bool) == Some(true))
-            .filter(|model| model.get("visibility").and_then(Value::as_str) != Some("hidden"))
-            .filter_map(|model| {
-                Some((
-                    model.get("priority")?.as_i64()?,
-                    model.get("slug")?.as_str()?.to_string(),
-                ))
-            })
-            .min_by_key(|(priority, _)| *priority)
-            .map(|(_, slug)| slug)
-    }
-
-    pub fn contains_model_slug(&self, slug: &str) -> bool {
-        let json = self.load_json();
-        let Some(models) = json.get("models").and_then(Value::as_array) else {
-            return false;
-        };
-        models.iter().any(|model| {
-            model
-                .get("slug")
-                .and_then(Value::as_str)
-                .is_some_and(|candidate| candidate == slug)
-        })
-    }
-
-    pub fn etag(&self) -> Option<String> {
-        self.load_json()
-            .get("etag")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
-
-    pub fn client_version(&self) -> Option<String> {
-        self.load_json()
-            .get("client_version")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
-}
+/// OpenAI-compatible empty response.
+const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
 
 pub async fn list_models(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-) -> Response<axum::body::Body> {
+) -> axum::response::Response<axum::body::Body> {
     if let Err(err) = require_proxy_api_key(&state, &headers) {
-        return axum::response::IntoResponse::into_response(err);
+        return err.into_response();
     }
-    let json = state.models_cache.models_response_json();
-    let mut response = (StatusCode::OK, Json(json)).into_response();
-    if let Some(etag) = state.models_cache.etag()
-        && let Ok(header_value) = HeaderValue::from_str(&etag)
-    {
-        response
-            .headers_mut()
-            .insert(axum::http::header::ETAG, header_value);
+
+    // Pick any authenticated account to fetch models on behalf of.
+    let accounts = state.accounts.list_summaries().await;
+    let authed = accounts.iter().find(|a| a.auth.authenticated);
+    let Some(account) = authed else {
+        warn!("no authenticated account found for models request");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({}))).into_response();
+    };
+
+    // Resolve bearer token for this account.
+    let Some(record) = state.accounts.get_record(&account.id).await else {
+        warn!("failed to get record for account {}", account.id);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({}))).into_response();
+    };
+    let codex_home = record.codex_home(state.accounts.data_dir());
+    let auth_manager = codex_login::AuthManager::new(
+        codex_home,
+        /*enable_codex_api_key_env*/ false,
+        codex_login::AuthCredentialsStoreMode::File,
+    );
+    let Some(auth) = auth_manager.auth().await else {
+        warn!("auth manager returned no auth for account {}", account.id);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({}))).into_response();
+    };
+    let Ok(bearer_token) = auth.get_token() else {
+        warn!("failed to get token for account {}", account.id);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({}))).into_response();
+    };
+
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {bearer_token}")
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    if let Some(chatgpt_account_id) = &account.auth.account_id {
+        if let Ok(value) = HeaderValue::from_str(chatgpt_account_id) {
+            upstream_headers.insert("chatgpt-account-id", value);
+        }
     }
-    response
+
+    let response = state
+        .client
+        .get(format!(
+            "{UPSTREAM_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"
+        ))
+        .headers(upstream_headers)
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(body) => {
+                let upstream_models = body
+                    .get("models")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let data = rewrite_models_for_openai_compatibility(upstream_models);
+                let count = data.as_array().map(|a| a.len()).unwrap_or(0);
+                tracing::info!(count, "fetched models from upstream");
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "object": "list", "data": data })),
+                )
+                    .into_response()
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to parse upstream models response");
+                (StatusCode::OK, EMPTY_RESPONSE).into_response()
+            }
+        },
+        Ok(resp) => {
+            warn!(status = %resp.status(), "upstream models request failed");
+            (StatusCode::OK, EMPTY_RESPONSE).into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "upstream models request transport error");
+            (StatusCode::OK, EMPTY_RESPONSE).into_response()
+        }
+    }
+}
+
+/// Rewrite Codex-format model entries to be OpenAI-compatible.
+/// - Maps `slug` → `id`
+/// - Adds `object: "model"`
+/// - Filters out non-list (hidden) models
+fn rewrite_models_for_openai_compatibility(models: Value) -> Value {
+    let Some(models_arr) = models.as_array() else {
+        return models;
+    };
+    let rewritten: Vec<Value> = models_arr
+        .iter()
+        .filter(|m| m.get("visibility").and_then(|v| v.as_str()) == Some("list"))
+        .filter_map(|model| {
+            let slug = model.get("slug")?.as_str()?.to_string();
+            let mut out = serde_json::json!({
+                "id": slug,
+                "object": "model",
+            });
+            if let Some(name) = model.get("name") {
+                out["name"] = name.clone();
+            }
+            if let Some(ctx) = model.get("context_window") {
+                out["context_length"] = ctx.clone();
+            }
+            // Map input_modalities for Forge image support detection.
+            let input_modalities = model.get("input_modalities").cloned();
+            if input_modalities.is_some() {
+                out["architecture"] = serde_json::json!({
+                    "modality": "multimodal",
+                    "tokenizer": "o200k_base",
+                    "input_modalities": input_modalities,
+                });
+            }
+            Some(out)
+        })
+        .collect();
+    Value::Array(rewritten)
 }
