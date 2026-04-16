@@ -88,6 +88,7 @@ pub struct AccountSummary {
     pub state: AccountState,
     pub used_percent: Option<u8>,
     pub resets_at: Option<i64>,
+    pub cooldown_until: Option<i64>,
     pub inflight: usize,
     pub recent_failures: u32,
     pub codex_home: String,
@@ -308,13 +309,32 @@ impl AccountHandle {
         })
     }
 
+    async fn refresh_usage_state(&self) -> bool {
+        let Some(usage) = self.usage_snapshot().await else {
+            return false;
+        };
+        if let Ok(mut guard) = self.record.write() {
+            guard.used_percent = usage.primary_used_percent.map(|value| value.round() as u8);
+            guard.resets_at = usage.primary_resets_at;
+            let cooldown_until = self.cooldown_until.load(Ordering::Relaxed);
+            if cooldown_until <= current_unix_seconds() && guard.state == AccountState::RateLimited
+            {
+                guard.state = AccountState::Healthy;
+            }
+            return true;
+        }
+        false
+    }
+
     async fn summary(&self) -> AccountSummary {
         let record = self.record();
+        let cooldown_until = self.cooldown_until.load(Ordering::Relaxed);
         AccountSummary {
             id: record.id,
             state: record.state,
             used_percent: record.used_percent,
             resets_at: record.resets_at,
+            cooldown_until: (cooldown_until > current_unix_seconds()).then_some(cooldown_until),
             inflight: self.inflight.load(Ordering::Relaxed),
             recent_failures: self.recent_failures.load(Ordering::Relaxed),
             codex_home: record.codex_home.display().to_string(),
@@ -527,6 +547,18 @@ impl AccountRegistry {
             .iter()
             .find(|account| account.id() == account_id)
             .cloned()
+    }
+
+    pub async fn refresh_usage_state(&self) -> anyhow::Result<()> {
+        let accounts = self.accounts.read().await.clone();
+        let mut changed = false;
+        for account in accounts {
+            changed |= account.refresh_usage_state().await;
+        }
+        if changed {
+            self.persist().await?;
+        }
+        Ok(())
     }
 
     async fn persist(&self) -> anyhow::Result<()> {

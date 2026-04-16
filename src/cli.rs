@@ -2,6 +2,8 @@ use crate::accounts::AccountRegistry;
 use crate::accounts::CreateAccountRequest;
 use crate::accounts::StoredAccount;
 use crate::config::AppConfig;
+use crate::proxy_auth::ProxyAuth;
+use crate::proxy_auth::generate_api_key;
 use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
@@ -25,6 +27,8 @@ pub enum Command {
     Serve,
     Login(LoginArgs),
     ListAccounts(ListAccountsArgs),
+    SetApiKey(SetApiKeyArgs),
+    ApiKeyStatus,
 }
 
 #[derive(Debug, clap::Args)]
@@ -41,6 +45,11 @@ pub struct LoginArgs {
 pub struct ListAccountsArgs {
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SetApiKeyArgs {
+    pub value: Option<String>,
 }
 
 pub async fn handle_login_command(config: &AppConfig, args: LoginArgs) -> anyhow::Result<()> {
@@ -69,12 +78,40 @@ pub async fn handle_login_command(config: &AppConfig, args: LoginArgs) -> anyhow
     }
 }
 
+pub async fn handle_set_api_key_command(
+    config: &AppConfig,
+    args: SetApiKeyArgs,
+) -> anyhow::Result<()> {
+    let mut proxy_auth = ProxyAuth::load_or_create(&config.data_dir)?;
+    let api_key = args.value.unwrap_or_else(generate_api_key);
+    proxy_auth.set_api_key(&api_key)?;
+    println!("{api_key}");
+    Ok(())
+}
+
+pub fn handle_api_key_status_command(config: &AppConfig) -> anyhow::Result<()> {
+    let proxy_auth = ProxyAuth::load_or_create(&config.data_dir)?;
+    if proxy_auth.is_configured() {
+        println!("configured");
+    } else {
+        println!("not configured");
+    }
+    Ok(())
+}
+
 pub async fn handle_list_accounts_command(
     config: &AppConfig,
     args: ListAccountsArgs,
 ) -> anyhow::Result<()> {
     let registry = AccountRegistry::load_or_create(config.data_dir.clone()).await?;
-    let accounts = registry.list_summaries().await;
+    let mut accounts = registry.list_summaries().await;
+    accounts.sort_by_key(|account| {
+        account
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.secondary_resets_at)
+            .unwrap_or(i64::MAX)
+    });
     if accounts.is_empty() {
         println!("No accounts configured.");
         return Ok(());
@@ -113,6 +150,9 @@ pub async fn handle_list_accounts_command(
             }
         } else if !account.auth.authenticated {
             println!("  not authenticated");
+        }
+        if let Some(cooldown_until) = account.cooldown_until {
+            println!("  cooldown: {}", compact_resets_in(Some(cooldown_until)));
         }
 
         if args.verbose {

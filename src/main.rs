@@ -6,6 +6,7 @@ mod installation;
 mod logins;
 mod models;
 mod proxy;
+mod proxy_auth;
 
 use crate::accounts::AccountRegistry;
 use crate::cli::Cli;
@@ -15,6 +16,7 @@ use crate::installation::load_or_create_installation_id;
 use crate::logins::LoginManager;
 use crate::models::ModelsCache;
 use crate::proxy::AppState;
+use crate::proxy_auth::ProxyAuth;
 use anyhow::Context;
 use axum::Router;
 use axum::routing::get;
@@ -36,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Login(args) => cli::handle_login_command(&config, args).await,
         Command::ListAccounts(args) => cli::handle_list_accounts_command(&config, args).await,
+        Command::SetApiKey(args) => cli::handle_set_api_key_command(&config, args).await,
+        Command::ApiKeyStatus => cli::handle_api_key_status_command(&config),
     }
 }
 
@@ -53,13 +57,17 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
 
     let installation_id = load_or_create_installation_id(&config.data_dir)
         .context("failed to load or create installation id")?;
+    let proxy_auth =
+        ProxyAuth::load_or_create(&config.data_dir).context("failed to load proxy auth config")?;
     let state = Arc::new(AppState {
         client,
         accounts,
         logins: LoginManager::default(),
         models_cache: ModelsCache::default(),
         installation_id,
+        proxy_auth,
     });
+    tokio::spawn(usage_refresh_loop(Arc::clone(&state)));
 
     let app = Router::new()
         .route("/health", get(proxy::health))
@@ -103,6 +111,16 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
         .await
         .context("server error")?;
     Ok(())
+}
+
+async fn usage_refresh_loop(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        if let Err(err) = state.accounts.refresh_usage_state().await {
+            tracing::warn!(error = %err, "failed to refresh account usage state");
+        }
+    }
 }
 
 fn init_tracing() {
