@@ -210,6 +210,3 @@ git push origin v0.1.0
 
 The release workflow will build tarballs for Linux and macOS.
 
-## Next implementation steps
-
-1. Add sticky routing/session affinity.
