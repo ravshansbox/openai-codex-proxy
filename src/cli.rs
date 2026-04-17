@@ -134,16 +134,16 @@ pub async fn handle_list_accounts_command(
         if let Some(usage) = account.usage.clone() {
             if let Some(used_percent) = usage.primary_used_percent {
                 println!(
-                    "  {}: {} used, {}",
-                    compact_window_minutes(usage.primary_window_minutes),
+                    "  {} {}, {}",
+                    usage_indicator_bar(used_percent),
                     format_used_percent(used_percent),
                     compact_resets_in(usage.primary_resets_at)
                 );
             }
             if let Some(used_percent) = usage.secondary_used_percent {
                 println!(
-                    "  {}: {} used, {}",
-                    compact_window_minutes(usage.secondary_window_minutes),
+                    "  {} {}, {}",
+                    usage_indicator_bar(used_percent),
                     format_used_percent(used_percent),
                     compact_resets_in(usage.secondary_resets_at)
                 );
@@ -176,19 +176,6 @@ pub async fn handle_list_accounts_command(
     }
 
     Ok(())
-}
-
-fn compact_window_minutes(window_minutes: Option<i64>) -> String {
-    let Some(minutes) = window_minutes else {
-        return "unknown".to_string();
-    };
-    if minutes % (60 * 24) == 0 {
-        return format!("{}d", minutes / (60 * 24));
-    }
-    if minutes % 60 == 0 {
-        return format!("{}h", minutes / 60);
-    }
-    format!("{}m", minutes)
 }
 
 fn humanize_minutes(minutes: i64) -> String {
@@ -231,6 +218,14 @@ fn compact_resets_in(resets_at: Option<i64>) -> String {
 
 fn format_used_percent(used_percent: f64) -> String {
     format!("{:.0}%", used_percent)
+}
+
+fn usage_indicator_bar(used_percent: f64) -> String {
+    const BAR_WIDTH: usize = 12;
+    let clamped_percent = used_percent.clamp(0.0, 100.0);
+    let filled = ((clamped_percent / 100.0) * BAR_WIDTH as f64).round() as usize;
+    let empty = BAR_WIDTH.saturating_sub(filled);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(empty))
 }
 
 async fn login_with_browser(
