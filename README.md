@@ -63,8 +63,7 @@ Upstream, the proxy manages **real Codex OAuth accounts** and selects one authen
 This scaffold now includes:
 
 - an `axum` HTTP server
-- persistent account registry under `data/accounts.json`
-- per-account auth homes under `data/accounts/<account-id>/`
+- auto-discovered per-account auth homes under `~/.openai-codex-proxy/accounts/<account-id>/`
 - browser OAuth login
 - device-code OAuth login
 - login status polling
@@ -158,13 +157,7 @@ These endpoints require the proxy API key.
 - `GET /accounts/:account_id`
 - `DELETE /accounts/:account_id`
 
-Create account body:
-
-```json
-{
-  "preference": 10
-}
-```
+`POST /accounts` now just creates a new local account directory / id. Accounts are auto-discovered from the `accounts/` directory; there is no global `accounts.json` registry.
 
 ### Login flows
 
@@ -175,7 +168,7 @@ Recommended one-step endpoints:
 - `POST /accounts/login/browser/start`
 - `POST /accounts/login/device-code/start`
 
-These endpoints no longer require you to provide account names or tags.
+These endpoints create a fresh account directory, start OAuth, and the proxy auto-discovers it from disk.
 
 Lower-level endpoints still exist if you want to attach OAuth to an already-created local account record:
 

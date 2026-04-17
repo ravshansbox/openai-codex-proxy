@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,21 +38,9 @@ impl AccountState {
     }
 }
 
-fn default_account_state() -> AccountState {
-    AccountState::Healthy
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct StoredAccount {
     pub id: String,
-    #[serde(default = "default_account_state")]
-    pub state: AccountState,
-    #[serde(default)]
-    pub used_percent: Option<u8>,
-    #[serde(default)]
-    pub resets_at: Option<i64>,
-    #[serde(default)]
-    pub preference: i32,
 }
 
 impl StoredAccount {
@@ -61,10 +50,7 @@ impl StoredAccount {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct CreateAccountRequest {
-    #[serde(default)]
-    pub preference: i32,
-}
+pub struct CreateAccountRequest {}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AccountAuthSnapshot {
@@ -103,20 +89,39 @@ pub struct AccountSummary {
     pub usage: Option<AccountUsageSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeAccountState {
+    state: AccountState,
+    used_percent: Option<u8>,
+    resets_at: Option<i64>,
+}
+
+impl Default for RuntimeAccountState {
+    fn default() -> Self {
+        Self {
+            state: AccountState::Healthy,
+            used_percent: None,
+            resets_at: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AccountHandle {
-    record: RwLock<StoredAccount>,
+    id: String,
     data_dir: PathBuf,
+    runtime: RwLock<RuntimeAccountState>,
     inflight: AtomicUsize,
     recent_failures: AtomicU32,
     cooldown_until: AtomicI64,
 }
 
 impl AccountHandle {
-    fn new(record: StoredAccount, data_dir: PathBuf) -> Self {
+    fn new(id: String, data_dir: PathBuf) -> Self {
         Self {
-            record: RwLock::new(record),
+            id,
             data_dir,
+            runtime: RwLock::new(RuntimeAccountState::default()),
             inflight: AtomicUsize::new(0),
             recent_failures: AtomicU32::new(0),
             cooldown_until: AtomicI64::new(0),
@@ -124,32 +129,19 @@ impl AccountHandle {
     }
 
     fn codex_home(&self) -> PathBuf {
-        let id = self
-            .record
-            .read()
-            .map(|guard| guard.id.clone())
-            .unwrap_or_default();
-        self.data_dir.join("accounts").join(id)
+        self.data_dir.join("accounts").join(&self.id)
     }
 
     pub fn id(&self) -> String {
-        self.record
-            .read()
-            .map(|guard| guard.id.clone())
-            .unwrap_or_default()
+        self.id.clone()
     }
 
     pub fn record(&self) -> StoredAccount {
-        self.record
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|_| StoredAccount {
-                id: String::new(),
-                state: AccountState::Disabled,
-                used_percent: None,
-                resets_at: None,
-                preference: 0,
-            })
+        StoredAccount { id: self.id() }
+    }
+
+    fn runtime_state(&self) -> RuntimeAccountState {
+        self.runtime.read().map(|guard| guard.clone()).unwrap_or_default()
     }
 
     fn accepting_new_requests(&self) -> bool {
@@ -159,15 +151,11 @@ impl AccountHandle {
             return false;
         }
         self.clear_expired_rate_limit(now);
-        self.record
-            .read()
-            .map(|guard| {
-                guard.state.is_candidate()
-                    && guard
-                        .used_percent
-                        .is_none_or(|used_percent| used_percent < MAX_USED_PERCENT_FOR_NEW_REQUESTS)
-            })
-            .unwrap_or(false)
+        let runtime = self.runtime_state();
+        runtime.state.is_candidate()
+            && runtime
+                .used_percent
+                .is_none_or(|used_percent| used_percent < MAX_USED_PERCENT_FOR_NEW_REQUESTS)
     }
 
     fn score(&self) -> Option<i32> {
@@ -175,13 +163,13 @@ impl AccountHandle {
             return None;
         }
 
-        let guard = self.record.read().ok()?;
-        let headroom = 100 - i32::from(guard.used_percent.unwrap_or(0));
-        let used_penalty = guard
+        let runtime = self.runtime_state();
+        let headroom = 100 - i32::from(runtime.used_percent.unwrap_or(0));
+        let used_penalty = runtime
             .used_percent
             .map(|used_percent| if used_percent >= 85 { 25 } else { 0 })
             .unwrap_or(0);
-        let state_penalty = match guard.state {
+        let state_penalty = match runtime.state {
             AccountState::Healthy => 0,
             AccountState::CoolingDown => 20,
             AccountState::RateLimited | AccountState::NeedsReauth | AccountState::Disabled => {
@@ -191,22 +179,16 @@ impl AccountHandle {
         let inflight_penalty = self.inflight.load(Ordering::Relaxed) as i32 * 10;
         let recent_failure_penalty = self.recent_failures.load(Ordering::Relaxed) as i32 * 20;
 
-        Some(
-            headroom + guard.preference
-                - used_penalty
-                - state_penalty
-                - inflight_penalty
-                - recent_failure_penalty,
-        )
+        Some(headroom - used_penalty - state_penalty - inflight_penalty - recent_failure_penalty)
     }
 
     pub fn note_success(&self) {
         self.recent_failures.store(0, Ordering::Relaxed);
         self.cooldown_until.store(0, Ordering::Relaxed);
-        if let Ok(mut guard) = self.record.write()
-            && guard.state == AccountState::RateLimited
+        if let Ok(mut runtime) = self.runtime.write()
+            && runtime.state == AccountState::RateLimited
         {
-            guard.state = AccountState::Healthy;
+            runtime.state = AccountState::Healthy;
         }
     }
 
@@ -217,12 +199,12 @@ impl AccountHandle {
     pub fn note_rate_limited(&self, resets_at: Option<i64>, used_percent: Option<u8>) {
         let cooldown_until = resets_at.unwrap_or_else(|| current_unix_seconds() + 300);
         self.cooldown_until.store(cooldown_until, Ordering::Relaxed);
-        if let Ok(mut guard) = self.record.write() {
-            guard.state = AccountState::RateLimited;
+        if let Ok(mut runtime) = self.runtime.write() {
+            runtime.state = AccountState::RateLimited;
             if let Some(used_percent) = used_percent {
-                guard.used_percent = Some(used_percent);
+                runtime.used_percent = Some(used_percent);
             }
-            guard.resets_at = Some(cooldown_until);
+            runtime.resets_at = Some(cooldown_until);
         }
     }
 
@@ -231,10 +213,10 @@ impl AccountHandle {
         if cooldown_until > now {
             return;
         }
-        if let Ok(mut guard) = self.record.write()
-            && guard.state == AccountState::RateLimited
+        if let Ok(mut runtime) = self.runtime.write()
+            && runtime.state == AccountState::RateLimited
         {
-            guard.state = AccountState::Healthy;
+            runtime.state = AccountState::Healthy;
         }
     }
 
@@ -306,10 +288,7 @@ impl AccountHandle {
                 .primary
                 .as_ref()
                 .and_then(|window| window.window_minutes),
-            primary_resets_at: snapshot
-                .primary
-                .as_ref()
-                .and_then(|window| window.resets_at),
+            primary_resets_at: snapshot.primary.as_ref().and_then(|window| window.resets_at),
             secondary_used_percent: snapshot
                 .secondary
                 .as_ref()
@@ -318,38 +297,33 @@ impl AccountHandle {
                 .secondary
                 .as_ref()
                 .and_then(|window| window.window_minutes),
-            secondary_resets_at: snapshot
-                .secondary
-                .as_ref()
-                .and_then(|window| window.resets_at),
+            secondary_resets_at: snapshot.secondary.as_ref().and_then(|window| window.resets_at),
         })
     }
 
-    async fn refresh_usage_state(&self) -> bool {
+    async fn refresh_usage_state(&self) {
         let Some(usage) = self.usage_snapshot().await else {
-            return false;
+            return;
         };
-        if let Ok(mut guard) = self.record.write() {
-            guard.used_percent = usage.primary_used_percent.map(|value| value.round() as u8);
-            guard.resets_at = usage.primary_resets_at;
+        if let Ok(mut runtime) = self.runtime.write() {
+            runtime.used_percent = usage.primary_used_percent.map(|value| value.round() as u8);
+            runtime.resets_at = usage.primary_resets_at;
             let cooldown_until = self.cooldown_until.load(Ordering::Relaxed);
-            if cooldown_until <= current_unix_seconds() && guard.state == AccountState::RateLimited
+            if cooldown_until <= current_unix_seconds() && runtime.state == AccountState::RateLimited
             {
-                guard.state = AccountState::Healthy;
+                runtime.state = AccountState::Healthy;
             }
-            return true;
         }
-        false
     }
 
     async fn summary(&self) -> AccountSummary {
-        let record = self.record();
+        let runtime = self.runtime_state();
         let cooldown_until = self.cooldown_until.load(Ordering::Relaxed);
         AccountSummary {
-            id: record.id,
-            state: record.state,
-            used_percent: record.used_percent,
-            resets_at: record.resets_at,
+            id: self.id(),
+            state: runtime.state,
+            used_percent: runtime.used_percent,
+            resets_at: runtime.resets_at,
             cooldown_until: (cooldown_until > current_unix_seconds()).then_some(cooldown_until),
             inflight: self.inflight.load(Ordering::Relaxed),
             recent_failures: self.recent_failures.load(Ordering::Relaxed),
@@ -371,8 +345,7 @@ pub enum ResolveAuthError {
 #[derive(Clone, Debug)]
 pub struct AccountRegistry {
     data_dir: PathBuf,
-    accounts_path: PathBuf,
-    accounts: Arc<AsyncRwLock<Vec<Arc<AccountHandle>>>>,
+    accounts: Arc<AsyncRwLock<HashMap<String, Arc<AccountHandle>>>>,
     session_affinity: Arc<AsyncRwLock<HashMap<String, String>>>,
 }
 
@@ -381,27 +354,14 @@ impl AccountRegistry {
         fs::create_dir_all(data_dir.join("accounts"))
             .await
             .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
-        let accounts_path = data_dir.join("accounts.json");
-        let accounts = if fs::try_exists(&accounts_path).await.unwrap_or(false) {
-            let raw = fs::read_to_string(&accounts_path)
-                .await
-                .with_context(|| format!("failed to read {}", accounts_path.display()))?;
-            let stored: Vec<StoredAccount> = serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", accounts_path.display()))?;
-            stored
-                .into_iter()
-                .map(|account| Arc::new(AccountHandle::new(account, data_dir.clone())))
-                .collect()
-        } else {
-            Vec::new()
-        };
 
-        Ok(Self {
+        let registry = Self {
             data_dir,
-            accounts_path,
-            accounts: Arc::new(AsyncRwLock::new(accounts)),
+            accounts: Arc::new(AsyncRwLock::new(HashMap::new())),
             session_affinity: Arc::new(AsyncRwLock::new(HashMap::new())),
-        })
+        };
+        registry.sync_from_disk_inner().await?;
+        Ok(registry)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -409,7 +369,8 @@ impl AccountRegistry {
     }
 
     pub async fn list_summaries(&self) -> Vec<AccountSummary> {
-        let accounts = self.accounts.read().await.clone();
+        self.sync_from_disk().await;
+        let accounts = self.accounts_snapshot().await;
         let mut summaries = Vec::with_capacity(accounts.len());
         for account in accounts {
             summaries.push(account.summary().await);
@@ -418,59 +379,50 @@ impl AccountRegistry {
     }
 
     pub async fn get_summary(&self, account_id: &str) -> Option<AccountSummary> {
+        self.sync_from_disk().await;
         let account = self.find_handle(account_id).await?;
         Some(account.summary().await)
     }
 
     pub async fn create_account(
         &self,
-        request: CreateAccountRequest,
+        _request: CreateAccountRequest,
     ) -> anyhow::Result<StoredAccount> {
+        self.sync_from_disk().await;
+
         let account_id = Uuid::new_v4().to_string();
         let codex_home = self.data_dir.join("accounts").join(&account_id);
         fs::create_dir_all(&codex_home)
             .await
             .with_context(|| format!("failed to create {}", codex_home.display()))?;
 
-        let account = StoredAccount {
-            id: account_id,
-            state: AccountState::Healthy,
-            used_percent: None,
-            resets_at: None,
-            preference: request.preference,
-        };
-
-        let handle = Arc::new(AccountHandle::new(account.clone(), self.data_dir.clone()));
-        self.accounts.write().await.push(handle);
-        self.persist().await?;
+        let account = StoredAccount { id: account_id };
+        self.accounts.write().await.insert(
+            account.id.clone(),
+            Arc::new(AccountHandle::new(account.id.clone(), self.data_dir.clone())),
+        );
         Ok(account)
     }
 
     pub async fn delete_account(&self, account_id: &str) -> anyhow::Result<bool> {
-        let mut accounts = self.accounts.write().await;
-        let before = accounts.len();
-        let removed_paths: Vec<PathBuf> = accounts
-            .iter()
-            .filter(|account| account.id() == account_id)
-            .map(|account| account.codex_home())
-            .collect();
-        accounts.retain(|account| account.id() != account_id);
-        let removed = accounts.len() != before;
-        drop(accounts);
+        self.sync_from_disk().await;
 
-        if removed {
-            self.persist().await?;
-            for path in removed_paths {
-                let _ = fs::remove_dir_all(path).await;
-            }
+        let path = self.data_dir.join("accounts").join(account_id);
+        if !fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(false);
         }
-        Ok(removed)
+
+        self.accounts.write().await.remove(account_id);
+        self.clear_account_affinity(account_id).await;
+        fs::remove_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        Ok(true)
     }
 
     pub async fn get_record(&self, account_id: &str) -> Option<StoredAccount> {
-        self.find_handle(account_id)
-            .await
-            .map(|account| account.record())
+        self.sync_from_disk().await;
+        self.find_handle(account_id).await.map(|account| account.record())
     }
 
     pub async fn select_account(
@@ -479,7 +431,9 @@ impl AccountRegistry {
         session_id: Option<&str>,
         excluded_account_ids: &[String],
     ) -> Result<SelectedAccount, RouteError> {
-        let accounts = self.accounts.read().await.clone();
+        self.sync_from_disk().await;
+
+        let accounts = self.accounts_snapshot().await;
         if accounts.is_empty() {
             return Err(RouteError::NoAccountsConfigured);
         }
@@ -602,6 +556,7 @@ impl AccountRegistry {
         resets_at: Option<i64>,
         used_percent: Option<u8>,
     ) {
+        self.sync_from_disk().await;
         if let Some(account) = self.find_handle(account_id).await {
             account.note_rate_limited(resets_at, used_percent);
         }
@@ -611,12 +566,19 @@ impl AccountRegistry {
     }
 
     async fn find_handle(&self, account_id: &str) -> Option<Arc<AccountHandle>> {
-        self.accounts
+        self.accounts.read().await.get(account_id).cloned()
+    }
+
+    async fn accounts_snapshot(&self) -> Vec<Arc<AccountHandle>> {
+        let mut accounts = self
+            .accounts
             .read()
             .await
-            .iter()
-            .find(|account| account.id() == account_id)
+            .values()
             .cloned()
+            .collect::<Vec<_>>();
+        accounts.sort_by_key(|account| account.id());
+        accounts
     }
 
     async fn bind_session_affinity(&self, session_id: &str, account_id: &str) {
@@ -630,30 +592,66 @@ impl AccountRegistry {
         self.session_affinity.write().await.remove(session_id);
     }
 
+    async fn clear_account_affinity(&self, account_id: &str) {
+        self.session_affinity
+            .write()
+            .await
+            .retain(|_, bound_account_id| bound_account_id != account_id);
+    }
+
     pub async fn refresh_usage_state(&self) -> anyhow::Result<()> {
-        let accounts = self.accounts.read().await.clone();
-        let mut changed = false;
+        self.sync_from_disk_inner().await?;
+        let accounts = self.accounts_snapshot().await;
         for account in accounts {
-            changed |= account.refresh_usage_state().await;
-        }
-        if changed {
-            self.persist().await?;
+            account.refresh_usage_state().await;
         }
         Ok(())
     }
 
-    async fn persist(&self) -> anyhow::Result<()> {
-        let stored = self
-            .accounts
-            .read()
+    async fn sync_from_disk(&self) {
+        if let Err(err) = self.sync_from_disk_inner().await {
+            tracing::warn!(error = %err, "failed to sync accounts from disk");
+        }
+    }
+
+    async fn sync_from_disk_inner(&self) -> anyhow::Result<()> {
+        let discovered_ids = self.discover_account_ids().await?;
+        let mut accounts = self.accounts.write().await;
+        accounts.retain(|account_id, _| discovered_ids.contains(account_id));
+        for account_id in discovered_ids {
+            accounts.entry(account_id.clone()).or_insert_with(|| {
+                Arc::new(AccountHandle::new(account_id, self.data_dir.clone()))
+            });
+        }
+        Ok(())
+    }
+
+    async fn discover_account_ids(&self) -> anyhow::Result<HashSet<String>> {
+        let accounts_dir = self.data_dir.join("accounts");
+        let mut entries = fs::read_dir(&accounts_dir)
             .await
-            .iter()
-            .map(|account| account.record())
-            .collect::<Vec<_>>();
-        let json = serde_json::to_string_pretty(&stored).context("failed to serialize accounts")?;
-        fs::write(&self.accounts_path, json)
-            .await
-            .with_context(|| format!("failed to write {}", self.accounts_path.display()))
+            .with_context(|| format!("failed to read {}", accounts_dir.display()))?;
+        let mut account_ids = HashSet::new();
+
+        while let Some(entry) = entries.next_entry().await.with_context(|| {
+            format!("failed to iterate accounts dir {}", accounts_dir.display())
+        })? {
+            if !entry
+                .file_type()
+                .await
+                .with_context(|| format!("failed to stat {}", entry.path().display()))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            let account_id = entry.file_name().to_string_lossy().into_owned();
+            if Uuid::try_parse(&account_id).is_ok() {
+                account_ids.insert(account_id);
+            }
+        }
+
+        Ok(account_ids)
     }
 }
 
