@@ -14,8 +14,8 @@ anyhow = "1.0"
 axum = { version = "0.8", features = ["macros"] }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-codex-backend-client = { git = "https://github.com/openai/codex", subdirectory = "codex-rs/backend-client", version = "0.0.0" }
-codex-login = { git = "https://github.com/openai/codex", subdirectory = "codex-rs/login", version = "0.0.0" }
+codex-backend-client = { git = "https://github.com/openai/codex", version = "0.0.0", package = "codex-backend-client" }
+codex-login = { git = "https://github.com/openai/codex", version = "0.0.0", package = "codex-login" }
 futures-core = "0.3"
 futures-util = "0.3"
 pin-project-lite = "0.2"

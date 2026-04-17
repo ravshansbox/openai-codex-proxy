@@ -60,10 +60,10 @@ pub async fn list_models(
             .parse()
             .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
-    if let Some(chatgpt_account_id) = &account.auth.account_id {
-        if let Ok(value) = HeaderValue::from_str(chatgpt_account_id) {
-            upstream_headers.insert("chatgpt-account-id", value);
-        }
+    if let Some(chatgpt_account_id) = &account.auth.account_id
+        && let Ok(value) = HeaderValue::from_str(chatgpt_account_id)
+    {
+        upstream_headers.insert("chatgpt-account-id", value);
     }
 
     let response = state
