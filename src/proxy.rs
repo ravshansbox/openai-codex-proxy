@@ -37,6 +37,7 @@ const FEDRAMP_HEADER: &str = "x-openai-fedramp";
 const ORIGINATOR_HEADER: &str = "originator";
 const SESSION_ID_HEADER: &str = "session_id";
 const VERSION_HEADER: &str = "version";
+const X_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 const UPSTREAM_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -123,11 +124,21 @@ pub async fn proxy_responses(
             let body = Body::from_stream(stream);
 
             let mut builder = Response::builder().status(status);
+            let mut saw_content_type = false;
             for (name, value) in &response_headers {
                 if name == CONTENT_LENGTH || name == CONNECTION {
                     continue;
                 }
+                if value.as_bytes().is_empty() {
+                    continue;
+                }
+                if name == CONTENT_TYPE {
+                    saw_content_type = true;
+                }
                 builder = builder.header(name, value);
+            }
+            if !saw_content_type {
+                builder = builder.header(CONTENT_TYPE, "text/event-stream");
             }
 
             builder = builder.header(SELECTED_ACCOUNT_ID_HEADER, account_id);
@@ -141,7 +152,7 @@ pub async fn proxy_responses(
         let status = upstream_response.status();
         let response_headers = upstream_response.headers().clone();
         let body_bytes = upstream_response.bytes().await.unwrap_or_default();
-        let _response_body = String::from_utf8_lossy(&body_bytes).to_string();
+        let response_body = String::from_utf8_lossy(&body_bytes).to_string();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             let resets_at = parse_i64_header(&response_headers, "x-codex-primary-reset-at");
@@ -169,9 +180,16 @@ pub async fn proxy_responses(
         tracing::error!(
             status = %status,
             response_headers = ?response_headers,
+            response_body = %response_body,
             "upstream returned non-success status"
         );
-        return Err(ApiError::Internal(format!("upstream returned {status}")));
+        let detail = response_body.trim();
+        let message = if detail.is_empty() {
+            format!("upstream returned {status}")
+        } else {
+            format!("upstream returned {status}: {detail}")
+        };
+        return Err(ApiError::Internal(message));
     }
 }
 
@@ -253,8 +271,14 @@ fn build_upstream_headers(
         })?;
         upstream_headers.insert(HeaderName::from_static(SESSION_ID_HEADER), value);
     }
+    if !upstream_headers.contains_key(X_CLIENT_REQUEST_ID_HEADER) {
+        let value = HeaderValue::from_str(session_id).map_err(|err| {
+            ApiError::Internal(format!("failed to build x-client-request-id header: {err}"))
+        })?;
+        upstream_headers.insert(HeaderName::from_static(X_CLIENT_REQUEST_ID_HEADER), value);
+    }
     if !upstream_headers.contains_key(VERSION_HEADER) {
-        let value = HeaderValue::from_str(env!("CARGO_PKG_VERSION"))
+        let value = HeaderValue::from_str("0.121.0")
             .map_err(|err| ApiError::Internal(format!("failed to build version header: {err}")))?;
         upstream_headers.insert(HeaderName::from_static(VERSION_HEADER), value);
     }
@@ -292,9 +316,6 @@ fn rewrite_body_for_upstream(
             return (body, None);
         };
         let (rewritten, model) = rewrite_json_body(installation_id, Bytes::from(decoded));
-        if model.is_none() {
-            return (body, None);
-        }
         match zstd::stream::encode_all(std::io::Cursor::new(rewritten), 3) {
             Ok(encoded) => (Bytes::from(encoded), model),
             Err(_) => (body, None),
@@ -311,9 +332,7 @@ fn rewrite_json_body(installation_id: &str, body: Bytes) -> (Bytes, Option<Strin
     // No local model cache; pass through the model as-is.
     let rewritten_model = None;
     lift_input_instructions(&mut json);
-    if let Some(root) = json.as_object_mut() {
-        root.remove("max_output_tokens");
-    }
+    normalize_for_codex_upstream(&mut json);
     let client_metadata = json.as_object_mut().and_then(|root| {
         root.entry("client_metadata")
             .or_insert_with(|| serde_json::json!({}))
@@ -327,6 +346,40 @@ fn rewrite_json_body(installation_id: &str, body: Bytes) -> (Bytes, Option<Strin
     match serde_json::to_vec(&json) {
         Ok(updated) => (Bytes::from(updated), rewritten_model),
         Err(_) => (body, None),
+    }
+}
+
+fn normalize_for_codex_upstream(json: &mut serde_json::Value) {
+    let Some(root) = json.as_object_mut() else {
+        return;
+    };
+
+    root.insert("store".to_string(), serde_json::Value::Bool(false));
+    root.insert("stream".to_string(), serde_json::Value::Bool(true));
+    root.remove("temperature");
+    root.remove("max_output_tokens");
+
+    let needs_reasoning_include = root.get("reasoning").is_some();
+    if needs_reasoning_include {
+        let include = root
+            .entry("include".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if !include.is_array() {
+            *include = serde_json::Value::Array(Vec::new());
+        }
+        if let Some(items) = include.as_array_mut() {
+            let required = serde_json::Value::String("reasoning.encrypted_content".to_string());
+            if !items.iter().any(|item| item == &required) {
+                items.push(required);
+            }
+        }
+    }
+
+    let client_metadata = root
+        .entry("client_metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !client_metadata.is_object() {
+        *client_metadata = serde_json::json!({});
     }
 }
 
