@@ -12,10 +12,11 @@ A standalone proxy that makes **Codex CLI** see a local service as an OpenAI-com
 ### Install from git
 
 ```bash
-cargo install --git https://github.com/ravshansbox/openai-codex-proxy.git openai-codex-proxy
+cargo install --locked --git https://github.com/ravshansbox/openai-codex-proxy.git openai-codex-proxy
 ```
 
 This installs the `openai-codex-proxy` binary into Cargo's bin directory, typically `~/.cargo/bin`.
+Using `--locked` keeps installation reproducible and avoids pulling newer transitive dependency revisions than this repository was tested with.
 
 ### Run from source instead
 
