@@ -107,6 +107,81 @@ pub async fn list_models(
     }
 }
 
+/// Fetch the list of valid model slugs from the upstream API.
+/// Returns just the slug strings for use in request rewriting.
+pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result<Vec<String>> {
+    let accounts = state.accounts.list_summaries().await;
+    let authed = accounts.iter().find(|a| a.auth.authenticated);
+    let Some(account) = authed else {
+        anyhow::bail!("no authenticated account found for models fetch");
+    };
+
+    let Some(record) = state.accounts.get_record(&account.id).await else {
+        anyhow::bail!("failed to get record for account {}", account.id);
+    };
+    let codex_home = record.codex_home(state.accounts.data_dir());
+    let auth_manager = codex_login::AuthManager::new(
+        codex_home,
+        /*enable_codex_api_key_env*/ false,
+        codex_login::AuthCredentialsStoreMode::File,
+    );
+    let Some(auth) = auth_manager.auth().await else {
+        anyhow::bail!("auth manager returned no auth for account {}", account.id);
+    };
+    let Ok(bearer_token) = auth.get_token() else {
+        anyhow::bail!("failed to get token for account {}", account.id);
+    };
+
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {bearer_token}")
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    if let Some(chatgpt_account_id) = &account.auth.account_id
+        && let Ok(value) = HeaderValue::from_str(chatgpt_account_id)
+    {
+        upstream_headers.insert("chatgpt-account-id", value);
+    }
+
+    let response = state
+        .client
+        .get(format!(
+            "{UPSTREAM_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"
+        ))
+        .headers(upstream_headers)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "upstream models request failed with status {}",
+            response.status()
+        );
+    }
+
+    let body: Value = response.json().await?;
+    let upstream_models = body
+        .get("models")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+
+    let slugs = upstream_models
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| {
+                    m.get("visibility").and_then(|v| v.as_str()) == Some("list")
+                })
+                .filter_map(|m| m.get("slug")?.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(slugs)
+}
+
 /// Rewrite Codex-format model entries to be OpenAI-compatible.
 /// - Maps `slug` → `id`
 /// - Adds `object: "model"`
