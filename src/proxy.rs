@@ -26,6 +26,7 @@ use futures_util::TryStreamExt;
 use serde_json::json;
 use std::io;
 use std::sync::Arc;
+use std::sync::RwLock;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -48,6 +49,8 @@ pub struct AppState {
     pub logins: LoginManager,
     pub installation_id: String,
     pub proxy_auth: ProxyAuth,
+    /// Cached set of valid upstream model slugs, refreshed periodically.
+    pub valid_models: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -78,8 +81,13 @@ pub async fn proxy_responses(
     let content_encoding = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok());
+    let valid_models = state
+        .valid_models
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
     let (body, rewritten_model) =
-        rewrite_body_for_upstream(&state.installation_id, body, content_encoding);
+        rewrite_body_for_upstream(&state.installation_id, body, content_encoding, &valid_models);
     let mut excluded_account_ids = Vec::new();
 
     loop {
@@ -310,27 +318,44 @@ fn rewrite_body_for_upstream(
     installation_id: &str,
     body: Bytes,
     content_encoding: Option<&str>,
+    valid_models: &[String],
 ) -> (Bytes, Option<String>) {
     if content_encoding.is_some_and(is_zstd_encoding) {
         let Ok(decoded) = zstd::stream::decode_all(std::io::Cursor::new(&body)) else {
             return (body, None);
         };
-        let (rewritten, model) = rewrite_json_body(installation_id, Bytes::from(decoded));
+        let (rewritten, model) =
+            rewrite_json_body(installation_id, Bytes::from(decoded), valid_models);
         match zstd::stream::encode_all(std::io::Cursor::new(rewritten), 3) {
             Ok(encoded) => (Bytes::from(encoded), model),
             Err(_) => (body, None),
         }
     } else {
-        rewrite_json_body(installation_id, body)
+        rewrite_json_body(installation_id, body, valid_models)
     }
 }
 
-fn rewrite_json_body(installation_id: &str, body: Bytes) -> (Bytes, Option<String>) {
+fn rewrite_json_body(
+    installation_id: &str,
+    body: Bytes,
+    valid_models: &[String],
+) -> (Bytes, Option<String>) {
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (body, None);
     };
-    // No local model cache; pass through the model as-is.
-    let rewritten_model = None;
+
+    // Rewrite the model slug if it is not in the valid upstream models list.
+    let mut rewritten_model = None;
+    let model_value = json.get("model").and_then(|m| m.as_str()).map(String::from);
+    if let Some(model) = model_value {
+        if !valid_models.is_empty() && !valid_models.iter().any(|m| m == &model) {
+            if let Some(replacement) = pick_best_replacement(&model, valid_models) {
+                rewritten_model = Some(format!("{model} -> {replacement}"));
+                json["model"] = serde_json::Value::String(replacement);
+            }
+        }
+    }
+
     lift_input_instructions(&mut json);
     normalize_for_codex_upstream(&mut json);
     let client_metadata = json.as_object_mut().and_then(|root| {
@@ -443,6 +468,31 @@ fn extract_message_text(message: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+fn pick_best_replacement(requested_model: &str, valid_models: &[String]) -> Option<String> {
+    // Try exact suffix match first: e.g. "codex-mini-latest" might match a model
+    // ending in "-mini". Then fall back to the last model in the list (typically
+    // the most capable one).
+    let lower = requested_model.to_ascii_lowercase();
+
+    // Prefer models containing "codex" if the requested model contained it.
+    if lower.contains("codex") {
+        if let Some(m) = valid_models.iter().find(|m| m.to_ascii_lowercase().contains("codex")) {
+            return Some(m.clone());
+        }
+    }
+
+    // Prefer models containing "mini" if the request was for a mini variant.
+    if lower.contains("mini") {
+        if let Some(m) = valid_models.iter().find(|m| m.to_ascii_lowercase().contains("mini")) {
+            return Some(m.clone());
+        }
+    }
+
+    // Fall back to the first model (the most capable / default listed
+    // by the upstream).
+    valid_models.first().cloned()
 }
 
 fn is_zstd_encoding(value: &str) -> bool {
