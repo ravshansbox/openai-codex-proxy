@@ -197,7 +197,7 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
 /// - Maps `slug` → `id`
 /// - Adds `object: "model"`
 /// - Filters out non-list (hidden) models
-async fn resolve_codex_client_version(state: &crate::proxy::AppState) -> String {
+pub async fn resolve_codex_client_version(state: &crate::proxy::AppState) -> String {
     tracing::info!(url = GITHUB_LATEST_RELEASE_URL, "fetching latest Codex CLI version from GitHub");
     match fetch_latest_codex_client_version(state).await {
         Ok(version) => {
