@@ -100,7 +100,7 @@ pub async fn proxy_responses(
             .await?;
         let account_id = selected.lease.account_id();
         let account_score = selected.lease.score().to_string();
-        let upstream_headers = build_upstream_headers(&headers, &selected.auth, &session_id)?;
+        let upstream_headers = build_upstream_headers(&state, &headers, &selected.auth, &session_id).await?;
 
         tracing::info!(
             account_id = account_id,
@@ -247,7 +247,8 @@ fn parse_u8_header(headers: &HeaderMap, header_name: &str) -> Option<u8> {
         .and_then(|value| value.parse::<u8>().ok())
 }
 
-fn build_upstream_headers(
+async fn build_upstream_headers(
+    state: &AppState,
     incoming_headers: &HeaderMap,
     auth: &ResolvedUpstreamAuth,
     session_id: &str,
@@ -284,8 +285,10 @@ fn build_upstream_headers(
         upstream_headers.insert(HeaderName::from_static(X_CLIENT_REQUEST_ID_HEADER), value);
     }
     if !upstream_headers.contains_key(VERSION_HEADER) {
-        let value = HeaderValue::from_str("0.121.0")
-            .map_err(|err| ApiError::Internal(format!("failed to build version header: {err}")))?;
+        let resolved_version = crate::models::resolve_codex_client_version(state).await;
+        let value = HeaderValue::from_str(&resolved_version).map_err(|err| {
+            ApiError::Internal(format!("failed to build version header from resolved value {resolved_version}: {err}"))
+        })?;
         upstream_headers.insert(HeaderName::from_static(VERSION_HEADER), value);
     }
 
