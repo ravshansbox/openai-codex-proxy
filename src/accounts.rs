@@ -141,7 +141,10 @@ impl AccountHandle {
     }
 
     fn runtime_state(&self) -> RuntimeAccountState {
-        self.runtime.read().map(|guard| guard.clone()).unwrap_or_default()
+        self.runtime
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     fn accepting_new_requests(&self) -> bool {
@@ -288,7 +291,10 @@ impl AccountHandle {
                 .primary
                 .as_ref()
                 .and_then(|window| window.window_minutes),
-            primary_resets_at: snapshot.primary.as_ref().and_then(|window| window.resets_at),
+            primary_resets_at: snapshot
+                .primary
+                .as_ref()
+                .and_then(|window| window.resets_at),
             secondary_used_percent: snapshot
                 .secondary
                 .as_ref()
@@ -297,7 +303,10 @@ impl AccountHandle {
                 .secondary
                 .as_ref()
                 .and_then(|window| window.window_minutes),
-            secondary_resets_at: snapshot.secondary.as_ref().and_then(|window| window.resets_at),
+            secondary_resets_at: snapshot
+                .secondary
+                .as_ref()
+                .and_then(|window| window.resets_at),
         })
     }
 
@@ -309,7 +318,8 @@ impl AccountHandle {
             runtime.used_percent = usage.primary_used_percent.map(|value| value.round() as u8);
             runtime.resets_at = usage.primary_resets_at;
             let cooldown_until = self.cooldown_until.load(Ordering::Relaxed);
-            if cooldown_until <= current_unix_seconds() && runtime.state == AccountState::RateLimited
+            if cooldown_until <= current_unix_seconds()
+                && runtime.state == AccountState::RateLimited
             {
                 runtime.state = AccountState::Healthy;
             }
@@ -399,7 +409,10 @@ impl AccountRegistry {
         let account = StoredAccount { id: account_id };
         self.accounts.write().await.insert(
             account.id.clone(),
-            Arc::new(AccountHandle::new(account.id.clone(), self.data_dir.clone())),
+            Arc::new(AccountHandle::new(
+                account.id.clone(),
+                self.data_dir.clone(),
+            )),
         );
         Ok(account)
     }
@@ -422,7 +435,9 @@ impl AccountRegistry {
 
     pub async fn get_record(&self, account_id: &str) -> Option<StoredAccount> {
         self.sync_from_disk().await;
-        self.find_handle(account_id).await.map(|account| account.record())
+        self.find_handle(account_id)
+            .await
+            .map(|account| account.record())
     }
 
     pub async fn select_account(
@@ -619,9 +634,9 @@ impl AccountRegistry {
         let mut accounts = self.accounts.write().await;
         accounts.retain(|account_id, _| discovered_ids.contains(account_id));
         for account_id in discovered_ids {
-            accounts.entry(account_id.clone()).or_insert_with(|| {
-                Arc::new(AccountHandle::new(account_id, self.data_dir.clone()))
-            });
+            accounts
+                .entry(account_id.clone())
+                .or_insert_with(|| Arc::new(AccountHandle::new(account_id, self.data_dir.clone())));
         }
         Ok(())
     }
@@ -633,9 +648,11 @@ impl AccountRegistry {
             .with_context(|| format!("failed to read {}", accounts_dir.display()))?;
         let mut account_ids = HashSet::new();
 
-        while let Some(entry) = entries.next_entry().await.with_context(|| {
-            format!("failed to iterate accounts dir {}", accounts_dir.display())
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_context(|| format!("failed to iterate accounts dir {}", accounts_dir.display()))?
+        {
             if !entry
                 .file_type()
                 .await

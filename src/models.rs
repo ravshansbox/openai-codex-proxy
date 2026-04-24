@@ -6,6 +6,9 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::proxy::AppState;
@@ -14,6 +17,7 @@ use crate::proxy::require_proxy_api_key;
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.124.0";
 const UPSTREAM_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// OpenAI-compatible empty response.
 const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
@@ -21,6 +25,40 @@ const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
 #[derive(Debug, Deserialize)]
 struct GithubLatestRelease {
     tag_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexClientVersionCache {
+    inner: Arc<Mutex<CodexClientVersionCacheInner>>,
+}
+
+#[derive(Debug)]
+struct CodexClientVersionCacheInner {
+    version: String,
+    fetched_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModelsCache {
+    inner: Arc<Mutex<ModelsCacheInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ModelsCacheInner {
+    slugs: Vec<String>,
+    response: Option<Value>,
+    fetched_at: Option<Instant>,
+}
+
+impl Default for CodexClientVersionCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CodexClientVersionCacheInner {
+                version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
+                fetched_at: None,
+            })),
+        }
+    }
 }
 
 pub async fn list_models(
@@ -72,44 +110,10 @@ pub async fn list_models(
         upstream_headers.insert("chatgpt-account-id", value);
     }
 
-    let client_version = resolve_codex_client_version(&state).await;
-
-    let response = state
-        .client
-        .get(format!(
-            "{UPSTREAM_MODELS_URL}?client_version={client_version}"
-        ))
-        .headers(upstream_headers)
-        .send()
-        .await;
-
-    match response {
-        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => {
-                let upstream_models = body
-                    .get("models")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let data = rewrite_models_for_openai_compatibility(upstream_models);
-                let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-                tracing::info!(count, "fetched models from upstream");
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "object": "list", "data": data })),
-                )
-                    .into_response()
-            }
-            Err(err) => {
-                warn!(error = %err, "failed to parse upstream models response");
-                (StatusCode::OK, EMPTY_RESPONSE).into_response()
-            }
-        },
-        Ok(resp) => {
-            warn!(status = %resp.status(), "upstream models request failed");
-            (StatusCode::OK, EMPTY_RESPONSE).into_response()
-        }
+    match resolve_models(state.as_ref(), upstream_headers).await {
+        Ok(models) => Json(models).into_response(),
         Err(err) => {
-            warn!(error = %err, "upstream models request transport error");
+            warn!(error = %err, "failed to resolve models");
             (StatusCode::OK, EMPTY_RESPONSE).into_response()
         }
     }
@@ -153,8 +157,36 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         upstream_headers.insert("chatgpt-account-id", value);
     }
 
-    let client_version = resolve_codex_client_version(state).await;
+    let models = resolve_models(state, upstream_headers).await?;
+    let slugs = models
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id")?.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
 
+    Ok(slugs)
+}
+
+async fn resolve_models(
+    state: &crate::proxy::AppState,
+    upstream_headers: reqwest::header::HeaderMap,
+) -> anyhow::Result<Value> {
+    let now = Instant::now();
+    let mut cache = state.models.inner.lock().await;
+    if cache
+        .fetched_at
+        .is_some_and(|fetched_at| now.duration_since(fetched_at) < CACHE_TTL)
+    {
+        if let Some(response) = cache.response.clone() {
+            return Ok(response);
+        }
+    }
+
+    let client_version = resolve_codex_client_version(state).await;
     let response = state
         .client
         .get(format!(
@@ -165,6 +197,7 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         .await?;
 
     if !response.status().is_success() {
+        cache.fetched_at = Some(now);
         anyhow::bail!(
             "upstream models request failed with status {}",
             response.status()
@@ -176,21 +209,19 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         .get("models")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
+    let data = rewrite_models_for_openai_compatibility(upstream_models);
+    let slugs = model_ids(&data);
+    let models = serde_json::json!({ "object": "list", "data": data });
+    tracing::info!(count = slugs.len(), "fetched models from upstream");
 
-    let mut slugs: Vec<String> = upstream_models
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|m| {
-                    m.get("visibility").and_then(|v| v.as_str()) == Some("list")
-                })
-                .filter_map(|m| m.get("slug")?.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    cache.slugs = slugs;
+    cache.response = Some(models.clone());
+    cache.fetched_at = Some(now);
+    Ok(models)
+}
 
-    slugs.sort();
-    Ok(slugs)
+pub async fn cached_model_slugs(state: &crate::proxy::AppState) -> Vec<String> {
+    state.models.inner.lock().await.slugs.clone()
 }
 
 /// Rewrite Codex-format model entries to be OpenAI-compatible.
@@ -198,15 +229,30 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
 /// - Adds `object: "model"`
 /// - Filters out non-list (hidden) models
 pub async fn resolve_codex_client_version(state: &crate::proxy::AppState) -> String {
-    tracing::info!(url = GITHUB_LATEST_RELEASE_URL, "fetching latest Codex CLI version from GitHub");
+    let now = Instant::now();
+    let mut cache = state.codex_client_version.inner.lock().await;
+    if cache
+        .fetched_at
+        .is_some_and(|fetched_at| now.duration_since(fetched_at) < CACHE_TTL)
+    {
+        return cache.version.clone();
+    }
+
+    tracing::info!(
+        url = GITHUB_LATEST_RELEASE_URL,
+        "fetching latest Codex CLI version from GitHub"
+    );
     match fetch_latest_codex_client_version(state).await {
         Ok(version) => {
             tracing::info!(version, "using latest Codex CLI version from GitHub");
+            cache.version = version.clone();
+            cache.fetched_at = Some(now);
             version
         }
         Err(err) => {
-            warn!(error = %err, default = DEFAULT_CODEX_CLIENT_VERSION, "failed to fetch Codex CLI version from GitHub; using default");
-            DEFAULT_CODEX_CLIENT_VERSION.to_string()
+            warn!(error = %err, default = cache.version, "failed to fetch Codex CLI version from GitHub; using cached/default");
+            cache.fetched_at = Some(now);
+            cache.version.clone()
         }
     }
 }
@@ -225,7 +271,10 @@ async fn fetch_latest_codex_client_version(
         .await?;
 
     let Some(version) = normalize_codex_client_version(&release.tag_name) else {
-        anyhow::bail!("GitHub latest release tag_name was invalid: {}", release.tag_name);
+        anyhow::bail!(
+            "GitHub latest release tag_name was invalid: {}",
+            release.tag_name
+        );
     };
 
     Ok(version)
@@ -243,15 +292,24 @@ fn normalize_codex_client_version(raw: &str) -> Option<String> {
         .unwrap_or(trimmed)
         .trim();
 
-    if candidate.is_empty()
-        || !candidate
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.')
-    {
+    if candidate.is_empty() || !candidate.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
     }
 
     Some(candidate.to_string())
+}
+
+fn model_ids(models: &Value) -> Vec<String> {
+    let mut slugs: Vec<String> = models
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id")?.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    slugs.sort();
+    slugs
 }
 
 fn rewrite_models_for_openai_compatibility(models: Value) -> Value {
