@@ -3,19 +3,35 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 use crate::proxy::AppState;
 use crate::proxy::require_proxy_api_key;
 
-/// Pretend to be the latest Codex CLI so the upstream returns the full model catalog.
-const CODEX_CLIENT_VERSION: &str = "0.121.0";
+const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.124.0";
 const UPSTREAM_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const CODEX_CLIENT_VERSION_CACHE_FILE: &str = "codex-client-version-cache.json";
+const CODEX_CLIENT_VERSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24;
 
 /// OpenAI-compatible empty response.
 const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
+
+#[derive(Debug, Deserialize)]
+struct GithubLatestRelease {
+    tag_name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedCodexClientVersion {
+    version: String,
+    fetched_at: u64,
+}
 
 pub async fn list_models(
     State(state): State<Arc<AppState>>,
@@ -66,10 +82,12 @@ pub async fn list_models(
         upstream_headers.insert("chatgpt-account-id", value);
     }
 
+    let client_version = resolve_codex_client_version(&state).await;
+
     let response = state
         .client
         .get(format!(
-            "{UPSTREAM_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"
+            "{UPSTREAM_MODELS_URL}?client_version={client_version}"
         ))
         .headers(upstream_headers)
         .send()
@@ -145,10 +163,12 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         upstream_headers.insert("chatgpt-account-id", value);
     }
 
+    let client_version = resolve_codex_client_version(state).await;
+
     let response = state
         .client
         .get(format!(
-            "{UPSTREAM_MODELS_URL}?client_version={CODEX_CLIENT_VERSION}"
+            "{UPSTREAM_MODELS_URL}?client_version={client_version}"
         ))
         .headers(upstream_headers)
         .send()
@@ -167,7 +187,7 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
 
-    let slugs = upstream_models
+    let mut slugs: Vec<String> = upstream_models
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -179,6 +199,7 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
         })
         .unwrap_or_default();
 
+    slugs.sort();
     Ok(slugs)
 }
 
@@ -186,11 +207,110 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
 /// - Maps `slug` → `id`
 /// - Adds `object: "model"`
 /// - Filters out non-list (hidden) models
+async fn resolve_codex_client_version(state: &crate::proxy::AppState) -> String {
+    let cache_path = state
+        .accounts
+        .data_dir()
+        .join(CODEX_CLIENT_VERSION_CACHE_FILE);
+
+    if let Some(version) = read_cached_codex_client_version(&cache_path).await {
+        tracing::info!(version, path = %cache_path.display(), "using cached Codex CLI version");
+        return version;
+    }
+
+    tracing::info!(url = GITHUB_LATEST_RELEASE_URL, path = %cache_path.display(), "fetching latest Codex CLI version from GitHub");
+    match fetch_and_cache_latest_codex_client_version(state, &cache_path).await {
+        Ok(version) => version,
+        Err(err) => {
+            warn!(error = %err, default = DEFAULT_CODEX_CLIENT_VERSION, "failed to refresh Codex CLI version from GitHub; using default");
+            DEFAULT_CODEX_CLIENT_VERSION.to_string()
+        }
+    }
+}
+
+async fn read_cached_codex_client_version(cache_path: &Path) -> Option<String> {
+    let raw = tokio::fs::read(cache_path).await.ok()?;
+    let mut cached = serde_json::from_slice::<CachedCodexClientVersion>(&raw).ok()?;
+    let now = now_unix_seconds();
+    if now.saturating_sub(cached.fetched_at) > CODEX_CLIENT_VERSION_CACHE_TTL_SECS {
+        return None;
+    }
+
+    let normalized = normalize_codex_client_version(&cached.version)?;
+    if normalized != cached.version {
+        cached.version = normalized.clone();
+        if let Ok(bytes) = serde_json::to_vec(&cached) {
+            let _ = tokio::fs::write(cache_path, bytes).await;
+        }
+    }
+
+    Some(normalized)
+}
+
+async fn fetch_and_cache_latest_codex_client_version(
+    state: &crate::proxy::AppState,
+    cache_path: &Path,
+) -> anyhow::Result<String> {
+    let release = state
+        .client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GithubLatestRelease>()
+        .await?;
+
+    let Some(version) = normalize_codex_client_version(&release.tag_name) else {
+        anyhow::bail!("GitHub latest release tag_name was invalid: {}", release.tag_name);
+    };
+
+    let payload = CachedCodexClientVersion {
+        version: version.clone(),
+        fetched_at: now_unix_seconds(),
+    };
+    let bytes = serde_json::to_vec(&payload)?;
+    tokio::fs::write(cache_path, bytes).await?;
+    tracing::info!(version, path = %cache_path.display(), "refreshed cached Codex CLI version from GitHub");
+
+    Ok(version)
+}
+
+fn normalize_codex_client_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = trimmed
+        .rsplit_once('v')
+        .map(|(_, version)| version)
+        .unwrap_or(trimmed)
+        .trim();
+
+    if candidate.is_empty()
+        || !candidate
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return None;
+    }
+
+    Some(candidate.to_string())
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
+}
+
 fn rewrite_models_for_openai_compatibility(models: Value) -> Value {
     let Some(models_arr) = models.as_array() else {
         return models;
     };
-    let rewritten: Vec<Value> = models_arr
+    let mut rewritten: Vec<Value> = models_arr
         .iter()
         .filter(|m| m.get("visibility").and_then(|v| v.as_str()) == Some("list"))
         .filter_map(|model| {
@@ -217,5 +337,10 @@ fn rewrite_models_for_openai_compatibility(models: Value) -> Value {
             Some(out)
         })
         .collect();
+    rewritten.sort_by(|a, b| {
+        let a_id = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let b_id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        a_id.cmp(b_id)
+    });
     Value::Array(rewritten)
 }
