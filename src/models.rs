@@ -3,11 +3,9 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 use crate::proxy::AppState;
@@ -16,8 +14,6 @@ use crate::proxy::require_proxy_api_key;
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.124.0";
 const UPSTREAM_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
-const CODEX_CLIENT_VERSION_CACHE_FILE: &str = "codex-client-version-cache.json";
-const CODEX_CLIENT_VERSION_CACHE_TTL_SECS: u64 = 60 * 60 * 24;
 
 /// OpenAI-compatible empty response.
 const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
@@ -25,12 +21,6 @@ const EMPTY_RESPONSE: &str = r#"{"object":"list","data":[]}"#;
 #[derive(Debug, Deserialize)]
 struct GithubLatestRelease {
     tag_name: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct CachedCodexClientVersion {
-    version: String,
-    fetched_at: u64,
 }
 
 pub async fn list_models(
@@ -208,48 +198,21 @@ pub async fn fetch_model_slugs(state: &crate::proxy::AppState) -> anyhow::Result
 /// - Adds `object: "model"`
 /// - Filters out non-list (hidden) models
 async fn resolve_codex_client_version(state: &crate::proxy::AppState) -> String {
-    let cache_path = state
-        .accounts
-        .data_dir()
-        .join(CODEX_CLIENT_VERSION_CACHE_FILE);
-
-    if let Some(version) = read_cached_codex_client_version(&cache_path).await {
-        tracing::info!(version, path = %cache_path.display(), "using cached Codex CLI version");
-        return version;
-    }
-
-    tracing::info!(url = GITHUB_LATEST_RELEASE_URL, path = %cache_path.display(), "fetching latest Codex CLI version from GitHub");
-    match fetch_and_cache_latest_codex_client_version(state, &cache_path).await {
-        Ok(version) => version,
+    tracing::info!(url = GITHUB_LATEST_RELEASE_URL, "fetching latest Codex CLI version from GitHub");
+    match fetch_latest_codex_client_version(state).await {
+        Ok(version) => {
+            tracing::info!(version, "using latest Codex CLI version from GitHub");
+            version
+        }
         Err(err) => {
-            warn!(error = %err, default = DEFAULT_CODEX_CLIENT_VERSION, "failed to refresh Codex CLI version from GitHub; using default");
+            warn!(error = %err, default = DEFAULT_CODEX_CLIENT_VERSION, "failed to fetch Codex CLI version from GitHub; using default");
             DEFAULT_CODEX_CLIENT_VERSION.to_string()
         }
     }
 }
 
-async fn read_cached_codex_client_version(cache_path: &Path) -> Option<String> {
-    let raw = tokio::fs::read(cache_path).await.ok()?;
-    let mut cached = serde_json::from_slice::<CachedCodexClientVersion>(&raw).ok()?;
-    let now = now_unix_seconds();
-    if now.saturating_sub(cached.fetched_at) > CODEX_CLIENT_VERSION_CACHE_TTL_SECS {
-        return None;
-    }
-
-    let normalized = normalize_codex_client_version(&cached.version)?;
-    if normalized != cached.version {
-        cached.version = normalized.clone();
-        if let Ok(bytes) = serde_json::to_vec(&cached) {
-            let _ = tokio::fs::write(cache_path, bytes).await;
-        }
-    }
-
-    Some(normalized)
-}
-
-async fn fetch_and_cache_latest_codex_client_version(
+async fn fetch_latest_codex_client_version(
     state: &crate::proxy::AppState,
-    cache_path: &Path,
 ) -> anyhow::Result<String> {
     let release = state
         .client
@@ -264,14 +227,6 @@ async fn fetch_and_cache_latest_codex_client_version(
     let Some(version) = normalize_codex_client_version(&release.tag_name) else {
         anyhow::bail!("GitHub latest release tag_name was invalid: {}", release.tag_name);
     };
-
-    let payload = CachedCodexClientVersion {
-        version: version.clone(),
-        fetched_at: now_unix_seconds(),
-    };
-    let bytes = serde_json::to_vec(&payload)?;
-    tokio::fs::write(cache_path, bytes).await?;
-    tracing::info!(version, path = %cache_path.display(), "refreshed cached Codex CLI version from GitHub");
 
     Ok(version)
 }
@@ -297,13 +252,6 @@ fn normalize_codex_client_version(raw: &str) -> Option<String> {
     }
 
     Some(candidate.to_string())
-}
-
-fn now_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs()
 }
 
 fn rewrite_models_for_openai_compatibility(models: Value) -> Value {
