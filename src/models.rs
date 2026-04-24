@@ -176,13 +176,15 @@ async fn resolve_models(
     upstream_headers: reqwest::header::HeaderMap,
 ) -> anyhow::Result<Value> {
     let now = Instant::now();
-    let mut cache = state.models.inner.lock().await;
-    if cache
-        .fetched_at
-        .is_some_and(|fetched_at| now.duration_since(fetched_at) < CACHE_TTL)
     {
-        if let Some(response) = cache.response.clone() {
-            return Ok(response);
+        let cache = state.models.inner.lock().await;
+        if cache
+            .fetched_at
+            .is_some_and(|fetched_at| now.duration_since(fetched_at) < CACHE_TTL)
+        {
+            if let Some(response) = cache.response.clone() {
+                return Ok(response);
+            }
         }
     }
 
@@ -197,6 +199,7 @@ async fn resolve_models(
         .await?;
 
     if !response.status().is_success() {
+        let mut cache = state.models.inner.lock().await;
         cache.fetched_at = Some(now);
         anyhow::bail!(
             "upstream models request failed with status {}",
@@ -214,6 +217,7 @@ async fn resolve_models(
     let models = serde_json::json!({ "object": "list", "data": data });
     tracing::info!(count = slugs.len(), "fetched models from upstream");
 
+    let mut cache = state.models.inner.lock().await;
     cache.slugs = slugs;
     cache.response = Some(models.clone());
     cache.fetched_at = Some(now);
