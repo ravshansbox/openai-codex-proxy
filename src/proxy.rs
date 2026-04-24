@@ -2,6 +2,8 @@ use crate::accounts::AccountRegistry;
 use crate::accounts::ResolvedUpstreamAuth;
 use crate::accounts::RouteError;
 use crate::logins::LoginManager;
+use crate::models::CodexClientVersionCache;
+use crate::models::ModelsCache;
 use crate::proxy_auth::ProxyAuth;
 use axum::Json;
 use axum::body::Body;
@@ -26,7 +28,6 @@ use futures_util::TryStreamExt;
 use serde_json::json;
 use std::io;
 use std::sync::Arc;
-use std::sync::RwLock;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -49,8 +50,10 @@ pub struct AppState {
     pub logins: LoginManager,
     pub installation_id: String,
     pub proxy_auth: ProxyAuth,
-    /// Cached set of valid upstream model slugs, refreshed periodically.
-    pub valid_models: Arc<RwLock<Vec<String>>>,
+    /// Cached latest Codex CLI version used for upstream requests.
+    pub codex_client_version: CodexClientVersionCache,
+    /// Cached upstream models list and valid model slugs.
+    pub models: ModelsCache,
 }
 
 #[derive(serde::Serialize)]
@@ -81,12 +84,13 @@ pub async fn proxy_responses(
     let content_encoding = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok());
-    let valid_models = state
-        .valid_models
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-    let body = rewrite_body_for_upstream(&state.installation_id, body, content_encoding, &valid_models);
+    let valid_models = crate::models::cached_model_slugs(&state).await;
+    let body = rewrite_body_for_upstream(
+        &state.installation_id,
+        body,
+        content_encoding,
+        &valid_models,
+    );
     let mut excluded_account_ids = Vec::new();
 
     loop {
@@ -100,7 +104,8 @@ pub async fn proxy_responses(
             .await?;
         let account_id = selected.lease.account_id();
         let account_score = selected.lease.score().to_string();
-        let upstream_headers = build_upstream_headers(&state, &headers, &selected.auth, &session_id).await?;
+        let upstream_headers =
+            build_upstream_headers(&state, &headers, &selected.auth, &session_id).await?;
 
         tracing::info!(
             account_id = account_id,
@@ -287,7 +292,9 @@ async fn build_upstream_headers(
     if !upstream_headers.contains_key(VERSION_HEADER) {
         let resolved_version = crate::models::resolve_codex_client_version(state).await;
         let value = HeaderValue::from_str(&resolved_version).map_err(|err| {
-            ApiError::Internal(format!("failed to build version header from resolved value {resolved_version}: {err}"))
+            ApiError::Internal(format!(
+                "failed to build version header from resolved value {resolved_version}: {err}"
+            ))
         })?;
         upstream_headers.insert(HeaderName::from_static(VERSION_HEADER), value);
     }
@@ -335,11 +342,7 @@ fn rewrite_body_for_upstream(
     }
 }
 
-fn rewrite_json_body(
-    installation_id: &str,
-    body: Bytes,
-    _valid_models: &[String],
-) -> Bytes {
+fn rewrite_json_body(installation_id: &str, body: Bytes, _valid_models: &[String]) -> Bytes {
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };

@@ -52,7 +52,9 @@ pub struct SetApiKeyArgs {
 
 pub async fn handle_login_command(config: &AppConfig, args: LoginArgs) -> anyhow::Result<()> {
     let registry = AccountRegistry::load_or_create(config.data_dir.clone()).await?;
-    let account = registry.create_account(CreateAccountRequest::default()).await?;
+    let account = registry
+        .create_account(CreateAccountRequest::default())
+        .await?;
 
     let login_result = if args.device_auth {
         login_with_device_code(&account, &config.data_dir).await

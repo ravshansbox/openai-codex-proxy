@@ -64,14 +64,14 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
         logins: LoginManager::default(),
         installation_id,
         proxy_auth,
-        valid_models: std::sync::RwLock::new(Vec::new()).into(),
+        codex_client_version: crate::models::CodexClientVersionCache::default(),
+        models: crate::models::ModelsCache::default(),
     });
     // Initial fetch of valid models.
-    if let Err(err) = refresh_valid_models(&state).await {
+    if let Err(err) = models::fetch_model_slugs(&state).await {
         tracing::warn!(error = %err, "failed to fetch initial model list");
     }
     tokio::spawn(usage_refresh_loop(Arc::clone(&state)));
-    tokio::spawn(model_refresh_loop(Arc::clone(&state)));
 
     let app = Router::new()
         .route("/health", get(proxy::health))
@@ -130,25 +130,6 @@ async fn usage_refresh_loop(state: Arc<AppState>) {
             tracing::warn!(error = %err, "failed to refresh account usage state");
         }
     }
-}
-
-async fn model_refresh_loop(state: Arc<AppState>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(3600));
-    loop {
-        interval.tick().await;
-        if let Err(err) = refresh_valid_models(&state).await {
-            tracing::warn!(error = %err, "failed to refresh model list");
-        }
-    }
-}
-
-async fn refresh_valid_models(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let models = models::fetch_model_slugs(state).await?;
-    if let Ok(mut guard) = state.valid_models.write() {
-        tracing::info!(count = models.len(), ?models, "refreshed valid model list");
-        *guard = models;
-    }
-    Ok(())
 }
 
 fn init_tracing() {
