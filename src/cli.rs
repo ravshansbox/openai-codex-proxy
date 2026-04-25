@@ -213,7 +213,14 @@ fn compact_resets_in(resets_at: Option<i64>) -> String {
 }
 
 fn format_used_percent(used_percent: f64) -> String {
-    format!("{:.0}%", used_percent)
+    let clamped_percent = used_percent.clamp(0.0, 100.0);
+    let mut formatted = format!("{:.0}%", clamped_percent.round());
+
+    if used_percent >= 100.0 {
+        formatted.push_str("(full)");
+    }
+
+    formatted
 }
 
 fn usage_indicator_bar(used_percent: f64) -> String {
