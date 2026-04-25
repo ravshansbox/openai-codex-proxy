@@ -128,20 +128,20 @@ pub async fn handle_list_accounts_command(
         println!("- {identity}{plan_suffix}");
 
         if let Some(usage) = account.usage.clone() {
-            if let Some(used_percent) = usage.primary_used_percent {
-                println!(
-                    "  {} {}, {}",
-                    usage_indicator_bar(used_percent),
-                    format_used_percent(used_percent),
-                    compact_resets_in(usage.primary_resets_at)
-                );
-            }
             if let Some(used_percent) = usage.secondary_used_percent {
                 println!(
                     "  {} {}, {}",
                     usage_indicator_bar(used_percent),
                     format_used_percent(used_percent),
                     compact_resets_in(usage.secondary_resets_at)
+                );
+            }
+            if let Some(used_percent) = usage.primary_used_percent {
+                println!(
+                    "  {} {}, {}",
+                    usage_indicator_bar(used_percent),
+                    format_used_percent(used_percent),
+                    compact_resets_in(usage.primary_resets_at)
                 );
             }
         } else if !account.auth.authenticated {
