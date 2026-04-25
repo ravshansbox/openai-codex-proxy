@@ -4,7 +4,6 @@ use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthManager;
 use serde::Deserialize;
 use serde::Serialize;
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,8 +18,6 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::sync::RwLock as AsyncRwLock;
 use uuid::Uuid;
-
-const MAX_USED_PERCENT_FOR_NEW_REQUESTS: u8 = 95;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -156,9 +153,6 @@ impl AccountHandle {
         self.clear_expired_rate_limit(now);
         let runtime = self.runtime_state();
         runtime.state.is_candidate()
-            && runtime
-                .used_percent
-                .is_none_or(|used_percent| used_percent < MAX_USED_PERCENT_FOR_NEW_REQUESTS)
     }
 
     fn score(&self) -> Option<i32> {
@@ -167,11 +161,6 @@ impl AccountHandle {
         }
 
         let runtime = self.runtime_state();
-        let headroom = 100 - i32::from(runtime.used_percent.unwrap_or(0));
-        let used_penalty = runtime
-            .used_percent
-            .map(|used_percent| if used_percent >= 85 { 25 } else { 0 })
-            .unwrap_or(0);
         let state_penalty = match runtime.state {
             AccountState::Healthy => 0,
             AccountState::CoolingDown => 20,
@@ -182,7 +171,7 @@ impl AccountHandle {
         let inflight_penalty = self.inflight.load(Ordering::Relaxed) as i32 * 10;
         let recent_failure_penalty = self.recent_failures.load(Ordering::Relaxed) as i32 * 20;
 
-        Some(headroom - used_penalty - state_penalty - inflight_penalty - recent_failure_penalty)
+        Some(-(state_penalty + inflight_penalty + recent_failure_penalty))
     }
 
     pub fn note_success(&self) {
@@ -453,43 +442,6 @@ impl AccountRegistry {
             return Err(RouteError::NoAccountsConfigured);
         }
 
-        let bound_account_id = if requested_account_id.is_none() {
-            match session_id {
-                Some(sid) => self.session_affinity.read().await.get(sid).cloned(),
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some(bound_account_id) = bound_account_id
-            && !excluded_account_ids
-                .iter()
-                .any(|id| id == &bound_account_id)
-            && let Some(account) = accounts
-                .iter()
-                .find(|account| account.id() == bound_account_id)
-            && let Some(score) = account.score()
-        {
-            match account.resolve_upstream_auth().await {
-                Ok(auth) => {
-                    account.inflight.fetch_add(1, Ordering::Relaxed);
-                    return Ok(SelectedAccount {
-                        lease: AccountLease {
-                            account: Arc::clone(account),
-                            score,
-                        },
-                        auth,
-                    });
-                }
-                Err(ResolveAuthError::NotAuthenticated) | Err(ResolveAuthError::Token(_)) => {
-                    if let Some(sid) = session_id {
-                        self.clear_session_affinity(sid).await;
-                    }
-                }
-            }
-        }
-
         let candidate_accounts = accounts
             .into_iter()
             .filter(|account| {
@@ -503,7 +455,7 @@ impl AccountRegistry {
 
         let mut candidates = Vec::new();
         for (score, account) in candidate_accounts {
-            let usage = if !excluded_account_ids.is_empty() && requested_account_id.is_none() {
+            let usage = if requested_account_id.is_none() {
                 account.usage_snapshot().await
             } else {
                 None
@@ -511,26 +463,16 @@ impl AccountRegistry {
             candidates.push((score, account, usage));
         }
 
-        candidates.sort_by_key(|(score, account, usage)| {
-            if !excluded_account_ids.is_empty() && requested_account_id.is_none() {
-                let secondary_reset = usage
+        candidates.sort_by_key(|(_score, account, usage)| {
+            let secondary_reset = if requested_account_id.is_none() {
+                usage
                     .as_ref()
                     .and_then(|usage| usage.secondary_resets_at)
-                    .unwrap_or(i64::MAX);
-                let secondary_used = usage
-                    .as_ref()
-                    .and_then(|usage| usage.secondary_used_percent)
-                    .map(|value| (value * 10.0) as i64)
-                    .unwrap_or(-1);
-                (
-                    secondary_reset,
-                    Reverse(secondary_used),
-                    Reverse(*score),
-                    account.id(),
-                )
+                    .unwrap_or(i64::MAX)
             } else {
-                (i64::MIN, Reverse(-1), Reverse(*score), account.id())
-            }
+                i64::MIN
+            };
+            (secondary_reset, account.id())
         });
 
         for (score, account, _usage) in candidates {

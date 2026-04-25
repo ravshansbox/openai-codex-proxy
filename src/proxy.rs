@@ -22,6 +22,7 @@ use axum::http::header::CONTENT_ENCODING;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::HOST;
+use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
 use codex_login::default_client::DEFAULT_ORIGINATOR;
 use futures_util::TryStreamExt;
@@ -166,7 +167,7 @@ pub async fn proxy_responses(
         let response_body = String::from_utf8_lossy(&body_bytes).to_string();
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let resets_at = parse_i64_header(&response_headers, "x-codex-primary-reset-at");
+            let resets_at = rate_limit_unblocks_at(&response_headers, &response_body);
             let used_percent = parse_u8_header(&response_headers, "x-codex-primary-used-percent");
             state
                 .accounts
@@ -250,6 +251,64 @@ fn parse_u8_header(headers: &HeaderMap, header_name: &str) -> Option<u8> {
         .get(header_name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u8>().ok())
+}
+
+fn rate_limit_unblocks_at(headers: &HeaderMap, body: &str) -> Option<i64> {
+    parse_usage_limit_resets_at(body)
+        .or_else(|| parse_retry_after_header(headers))
+        .or_else(|| parse_active_limit_reset_at(headers))
+        .or_else(|| parse_i64_header(headers, "x-codex-secondary-reset-at"))
+        .or_else(|| parse_i64_header(headers, "x-codex-primary-reset-at"))
+}
+
+fn parse_retry_after_header(headers: &HeaderMap) -> Option<i64> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(chrono::Utc::now().timestamp() + seconds.max(0));
+    }
+
+    chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|datetime| datetime.timestamp())
+}
+
+fn parse_usage_limit_resets_at(body: &str) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct UsageLimitResponse {
+        error: UsageLimitError,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UsageLimitError {
+        #[serde(rename = "type")]
+        error_type: Option<String>,
+        resets_at: Option<i64>,
+    }
+
+    let response = serde_json::from_str::<UsageLimitResponse>(body).ok()?;
+    (response.error.error_type.as_deref() == Some("usage_limit_reached"))
+        .then_some(response.error.resets_at)
+        .flatten()
+}
+
+fn parse_active_limit_reset_at(headers: &HeaderMap) -> Option<i64> {
+    let limit = headers
+        .get("x-codex-active-limit")?
+        .to_str()
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    if limit.is_empty() || limit == "codex" {
+        return None;
+    }
+
+    parse_i64_header(headers, &format!("x-{limit}-secondary-reset-at"))
+        .or_else(|| parse_i64_header(headers, &format!("x-{limit}-primary-reset-at")))
 }
 
 async fn build_upstream_headers(
