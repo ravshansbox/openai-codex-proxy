@@ -92,6 +92,7 @@ pub async fn proxy_responses(
         content_encoding,
         &valid_models,
     );
+    let request_info = RequestLogInfo::from_body(&body, content_encoding);
     let mut excluded_account_ids = Vec::new();
 
     loop {
@@ -108,12 +109,7 @@ pub async fn proxy_responses(
         let upstream_headers =
             build_upstream_headers(&state, &headers, &selected.auth, &session_id).await?;
 
-        tracing::info!(
-            account_id = account_id,
-            score = selected.lease.score(),
-            excluded_accounts = ?excluded_account_ids,
-            "proxying responses request"
-        );
+
 
         let upstream_response = state
             .client
@@ -129,8 +125,12 @@ pub async fn proxy_responses(
             let status = upstream_response.status();
             let response_headers = upstream_response.headers().clone();
             let lease = selected.lease;
+            let email = selected.auth.email.clone();
+            let model = request_info.model.clone();
+            let mut response_usage_logger = ResponseUsageLogger::default();
             let stream = upstream_response.bytes_stream().map_err(io::Error::other);
-            let stream = stream.inspect_ok(move |_| {
+            let stream = stream.inspect_ok(move |chunk| {
+                response_usage_logger.observe(chunk, email.as_deref(), model.as_deref());
                 let _lease_guard = &lease;
             });
             let body = Body::from_stream(stream);
@@ -379,6 +379,99 @@ async fn build_upstream_headers(
     }
 
     Ok(upstream_headers)
+}
+
+#[derive(Clone, Debug, Default)]
+struct RequestLogInfo {
+    model: Option<String>,
+}
+
+impl RequestLogInfo {
+    fn from_body(body: &Bytes, content_encoding: Option<&str>) -> Self {
+        if content_encoding.is_some_and(is_zstd_encoding) {
+            return Self::default();
+        }
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        Self {
+            model: json
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponseUsageLogger {
+    buffer: Vec<u8>,
+    logged: bool,
+}
+
+impl ResponseUsageLogger {
+    fn observe(&mut self, chunk: &Bytes, email: Option<&str>, request_model: Option<&str>) {
+        if self.logged {
+            return;
+        }
+        self.buffer.extend_from_slice(chunk);
+        while let Some(line_end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer.drain(..=line_end).collect::<Vec<_>>();
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if find_usage(&json).is_none() {
+                continue;
+            }
+            self.logged = true;
+            log_response_usage(email, request_model, &json);
+            break;
+        }
+    }
+}
+
+fn find_usage(event: &serde_json::Value) -> Option<&serde_json::Value> {
+    event.get("usage").or_else(|| {
+        event
+            .get("response")
+            .and_then(|response| response.get("usage"))
+    })
+}
+
+fn log_response_usage(
+    email: Option<&str>,
+    request_model: Option<&str>,
+    event: &serde_json::Value,
+) {
+    let model = event
+        .get("response")
+        .and_then(|response| response.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| event.get("model").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            event
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .and_then(|usage| usage.get("model"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or(request_model)
+        .unwrap_or("unknown");
+    tracing::info!(
+        email = email.unwrap_or("unknown"),
+        model = model,
+        "inference"
+    );
 }
 
 fn rewrite_body_for_upstream(

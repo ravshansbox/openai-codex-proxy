@@ -260,6 +260,7 @@ impl AccountHandle {
         Ok(ResolvedUpstreamAuth {
             bearer_token,
             chatgpt_account_id: auth.get_account_id(),
+            email: auth.get_account_email(),
             is_fedramp_account: auth.is_fedramp_account(),
         })
     }
@@ -654,6 +655,7 @@ pub struct SelectedAccount {
 pub struct ResolvedUpstreamAuth {
     pub bearer_token: String,
     pub chatgpt_account_id: Option<String>,
+    pub email: Option<String>,
     pub is_fedramp_account: bool,
 }
 
