@@ -23,6 +23,7 @@ Using `--locked` keeps installation reproducible and avoids pulling newer transi
 ```bash
 git clone https://github.com/ravshansbox/openai-codex-proxy.git
 cd openai-codex-proxy
+git config core.hooksPath .githooks   # enable conventional commits hook
 cargo run -- --help
 ```
 

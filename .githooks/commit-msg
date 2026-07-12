@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Conventional Commits hook -- validates the first line of the commit message.
+# Place in .githooks/commit-msg and run: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+
+# Read the first non-comment, non-empty line
+SUBJECT=$(grep -v '^#' "$COMMIT_MSG_FILE" | grep -v '^\s*$' | head -n1)
+
+# Allowed types (subset of conventional commits)
+TYPES="build|chore|ci|docs|feat|fix|perf|refactor|style|test|revert"
+
+# Pattern: type(optional-scope)!?: description
+# feat(auth): add OAuth flow
+# fix!: drop legacy endpoint
+# docs: update readme
+PATTERN="^(${TYPES})(\([a-zA-Z0-9._-]+\))?!?: .+"
+
+if [[ "$SUBJECT" =~ $PATTERN ]]; then
+    exit 0
+fi
+
+cat >&2 <<EOF
+╔══════════════════════════════════════════════════════════╗
+║  Commit message does not follow Conventional Commits.   ║
+╠══════════════════════════════════════════════════════════╣
+║  Format:   type(scope)!: description                    ║
+║  Types:    build, chore, ci, docs, feat, fix, perf,     ║
+║            refactor, style, test, revert                ║
+║  Examples:                                              ║
+║    feat(proxy): add request timeout                     ║
+║    fix: handle empty model list                         ║
+║    chore: update dependencies                           ║
+║    ci: add windows build target                         ║
+║    docs: clarify installation steps                     ║
+╠══════════════════════════════════════════════════════════╣
+║  To bypass (not recommended):                           ║
+║    git commit -m "..." --no-verify                      ║
+╚══════════════════════════════════════════════════════════╝
+
+Current subject: ${SUBJECT:-"(empty)"}
+EOF
+
+exit 1
