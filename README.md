@@ -233,4 +233,4 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow will build tarballs for Linux and macOS.
+The release workflow will build archives for macOS (ARM64) and Windows (x64).
