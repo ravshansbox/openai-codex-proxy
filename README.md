@@ -234,3 +234,14 @@ git push origin v0.1.0
 ```
 
 The release workflow will build archives for macOS (ARM64) and Windows (x64).
+
+To create a release, trigger the **bump-version** workflow from the Actions tab (or run it manually below), then the **release** workflow picks up the new tag automatically.
+
+```bash
+# Or manually from the CLI:
+# 1. Bump version
+sed -i "s/^version = \"$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')\"/version = \"X.Y.Z\"/" Cargo.toml
+# 2. Tag and push
+git add Cargo.toml && git commit -m "chore: bump version to vX.Y.Z"
+git tag vX.Y.Z && git push origin main && git push origin vX.Y.Z
+```

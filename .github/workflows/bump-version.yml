@@ -1,0 +1,83 @@
+name: bump-version
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: 'Bump level (patch, minor, major, or auto)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine bump level
+        id: level
+        run: |
+          if [ "${{ inputs.level }}" != "auto" ]; then
+            echo "bump=${{ inputs.level }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get commits since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LOG=$(git log "${LAST_TAG}..HEAD" --format="%s")
+
+          # Check for conventional commit markers
+          if echo "$LOG" | grep -qE '^[a-z]+!:' || echo "$LOG" | grep -qi 'BREAKING CHANGE'; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LOG" | grep -qE '^feat(\([^)]+\))?:'; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute next version
+        id: version
+        run: |
+          CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT"
+
+          case "${{ steps.level.outputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEXT="${MAJOR}.${MINOR}.${PATCH}"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Current: $CURRENT -> Next: $NEXT (level: ${{ steps.level.outputs.bump }})"
+
+      - name: Bump Cargo.toml
+        run: |
+          sed -i "s/^version = \"${{ steps.version.outputs.current }}\"/version = \"${{ steps.version.outputs.next }}\"/" Cargo.toml
+
+      - name: Commit, tag, push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to v${{ steps.version.outputs.next }}"
+          git tag "v${{ steps.version.outputs.next }}"
+          git push origin main
+          git push origin "v${{ steps.version.outputs.next }}"
