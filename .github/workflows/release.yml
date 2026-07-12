@@ -43,11 +43,11 @@ jobs:
 
       - name: Package (zip)
         if: matrix.ext == 'zip'
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
-          cd dist && zip ../${{ matrix.artifact }}.zip ${{ matrix.binary }}
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
