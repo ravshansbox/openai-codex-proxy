@@ -1,6 +1,6 @@
 [package]
 name = "openai-codex-proxy"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "OpenAI-compatible proxy for Codex subscription accounts with OAuth login and quota-aware failover"
 license = "MIT"
