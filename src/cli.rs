@@ -118,41 +118,35 @@ pub async fn handle_list_accounts_command(
             .auth
             .email
             .clone()
-            .unwrap_or_else(|| format!("account {}", account.id));
+            .unwrap_or_else(|| "not authenticated".to_string());
         let plan_suffix = account
             .auth
             .plan_type
             .clone()
             .map(|plan| format!(" ({plan})"))
             .unwrap_or_default();
-        println!("- {identity}{plan_suffix}");
+        println!("- {identity}{plan_suffix} [{}]", account.id);
 
-        if let Some(usage) = account.usage.clone() {
-            if let Some(used_percent) = usage.secondary_used_percent {
-                println!(
-                    "  {} {}, {}",
-                    usage_indicator_bar(used_percent),
-                    format_used_percent(used_percent),
-                    compact_resets_in(usage.secondary_resets_at)
-                );
-            }
-            if let Some(used_percent) = usage.primary_used_percent {
-                println!(
-                    "  {} {}, {}",
-                    usage_indicator_bar(used_percent),
-                    format_used_percent(used_percent),
-                    compact_resets_in(usage.primary_resets_at)
-                );
-            }
-        } else if !account.auth.authenticated {
-            println!("  not authenticated");
-        }
+        let usage = account.usage.clone();
+        println!(
+            "  {}",
+            usage_row(
+                usage.as_ref().and_then(|usage| usage.secondary_used_percent),
+                usage.as_ref().and_then(|usage| usage.secondary_resets_at),
+            )
+        );
+        println!(
+            "  {}",
+            usage_row(
+                usage.as_ref().and_then(|usage| usage.primary_used_percent),
+                usage.as_ref().and_then(|usage| usage.primary_resets_at),
+            )
+        );
         if let Some(cooldown_until) = account.cooldown_until {
             println!("  cooldown: {}", compact_resets_in(Some(cooldown_until)));
         }
 
         if args.verbose {
-            println!("  id: {}", account.id);
             println!("  authenticated: {}", account.auth.authenticated);
             if let Some(workspace) = account.auth.account_id {
                 println!("  workspace: {}", workspace);
@@ -221,6 +215,18 @@ fn format_used_percent(used_percent: f64) -> String {
     }
 
     formatted
+}
+
+fn usage_row(used_percent: Option<f64>, resets_at: Option<i64>) -> String {
+    let Some(used_percent) = used_percent else {
+        return format!("{} unknown", usage_indicator_bar(0.0));
+    };
+    format!(
+        "{} {}, {}",
+        usage_indicator_bar(used_percent),
+        format_used_percent(used_percent),
+        compact_resets_in(resets_at)
+    )
 }
 
 fn usage_indicator_bar(used_percent: f64) -> String {
