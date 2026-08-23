@@ -207,7 +207,7 @@ pub async fn proxy_responses(
 
 pub(crate) fn require_proxy_api_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     if !state.proxy_auth.is_configured() {
-        return Err(ApiError::ProxyAuthNotConfigured);
+        return Ok(());
     }
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -629,8 +629,6 @@ fn should_skip_request_header(header_name: &HeaderName) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ApiError {
-    #[error("proxy API key is not configured")]
-    ProxyAuthNotConfigured,
     #[error("missing proxy API key")]
     ProxyAuthMissing,
     #[error("invalid proxy API key")]
@@ -651,7 +649,6 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match &self {
-            Self::ProxyAuthNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             Self::ProxyAuthMissing | Self::ProxyAuthInvalid => StatusCode::UNAUTHORIZED,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::Route(RouteError::NoAccountsConfigured) => StatusCode::SERVICE_UNAVAILABLE,

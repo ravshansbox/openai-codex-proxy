@@ -113,7 +113,7 @@ async fn run_server(config: AppConfig) -> anyhow::Result<()> {
     if let Some(api_key) = state.proxy_auth.api_key() {
         tracing::info!("api_key={api_key}");
     } else {
-        tracing::warn!("api key: not configured — run `openai-codex-proxy set-api-key`");
+        tracing::warn!("api key: not configured — requests are accepted without authentication");
     }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

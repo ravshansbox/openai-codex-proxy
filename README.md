@@ -35,7 +35,7 @@ If you are running from a checkout, use `cargo run -- ...`.
 Installed binary:
 
 ```bash
-openai-codex-proxy set-api-key sk-local
+openai-codex-proxy set-api-key sk-local   # optional
 openai-codex-proxy login --browser
 openai-codex-proxy list-accounts
 openai-codex-proxy serve
@@ -44,7 +44,7 @@ openai-codex-proxy serve
 Run from source:
 
 ```bash
-cargo run -- set-api-key sk-local
+cargo run -- set-api-key sk-local   # optional
 cargo run -- login --browser
 cargo run -- list-accounts
 cargo run -- serve
@@ -71,7 +71,7 @@ This scaffold now includes:
 - `GET /v1/models` from the local Codex model cache
 - `POST /v1/responses` proxying using stored OAuth state
 - automatic routing across all authenticated accounts
-- single proxy API key protection for `/v1/*`
+- optional single proxy API key protection for `/v1/*`
 - request-time rewrite for stale unsupported model slugs using the local model cache
 - a direct CLI helper for login, account listing, and proxy API key setup
 
@@ -108,6 +108,9 @@ cargo run -- list-accounts --verbose
 ```
 
 ### Set the proxy API key
+
+This step is optional. Without a key, the proxy accepts unauthenticated requests.
+
 ```bash
 cargo run -- set-api-key
 ```
@@ -137,11 +140,13 @@ or
 cargo run -- serve
 ```
 
-All management and API endpoints except `/health` require:
+If a proxy API key is configured, all management and API endpoints except `/health` require:
 
 ```text
 Authorization: Bearer <proxy-api-key>
 ```
+
+If no proxy API key is configured, the proxy accepts every request without authentication.
 
 ## HTTP API
 
@@ -151,7 +156,7 @@ Authorization: Bearer <proxy-api-key>
 
 ### Accounts
 
-These endpoints require the proxy API key.
+These endpoints require the proxy API key if one is configured.
 
 - `GET /accounts`
 - `POST /accounts`
@@ -162,7 +167,7 @@ These endpoints require the proxy API key.
 
 ### Login flows
 
-These endpoints also require the proxy API key.
+These endpoints also require the proxy API key if one is configured.
 
 Recommended one-step endpoints:
 
